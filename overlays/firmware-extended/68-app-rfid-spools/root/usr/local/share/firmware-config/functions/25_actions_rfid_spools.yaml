@@ -18,5 +18,23 @@ actions:
         cmd:
           - sh
           - -c
-          - "logread 2>/dev/null | grep -i openrfid | tail -80"
+          - |
+            if ! pidof syslogd >/dev/null 2>&1; then
+              echo "WARNING: syslogd not running — starting it (ring buffer 256k)..."
+              syslogd -C256
+              sleep 1
+            fi
+            LINES=$(logread 2>/dev/null | grep -i openrfid | tail -80)
+            if [ -n "$LINES" ]; then
+              echo "$LINES"
+            else
+              echo "No OpenRFID entries found in syslog."
+              echo "Checking process status..."
+              PID=$(cat /var/run/openrfid.pid 2>/dev/null)
+              if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+                echo "OpenRFID is running (PID $PID). Logs may appear after the next tag event."
+              else
+                echo "OpenRFID is NOT running."
+              fi
+            fi
         message: "Fetching OpenRFID log entries..."

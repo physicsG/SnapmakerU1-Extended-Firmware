@@ -15,10 +15,11 @@
 # This pushes:
 #   1. Expanded OpenRFID webhook templates
 #   2. Patched filament_detect.py (applies patch in-place)
-#   3. RFID Spools web app (nginx config + HTML)
+#   3. RFID Spools web app (nginx config + HTML + filament_tag.py + klipper cfg)
 #   4. Spoolman fields setup script
+#   5. NTAG write support injection into fm175xx_reader.py
 #
-# After push, restarts OpenRFID and nginx.
+# After push, restarts OpenRFID, Klipper and nginx.
 
 set -eo pipefail
 
@@ -119,11 +120,109 @@ tar -cf - -C "$RFID_SPOOLS_ROOT" . |
 # Ensure nginx fluidd.d directory exists and reload
 ssh_cmd "mkdir -p /etc/nginx/fluidd.d"
 
+# Fix Windows line endings in init script (created on Windows with \r\n)
+ssh_cmd "if [ -f /etc/init.d/S98rfid-rw-api ]; then tr -d '\r' < /etc/init.d/S98rfid-rw-api > /tmp/_S98fix && mv /tmp/_S98fix /etc/init.d/S98rfid-rw-api; fi"
+
 # ── 4. Push Spoolman setup script ──
 echo ">> Setting permissions..."
 ssh_cmd "chmod +x /usr/local/bin/setup-spoolman-fields.sh"
+ssh_cmd "chmod +x /usr/local/bin/test-rfid-write.sh" || true
+ssh_cmd "chmod +x /usr/local/bin/rfid-rw.py" || true
+ssh_cmd "chmod +x /etc/init.d/S98rfid-rw-api" || true
 
-# ── 5. Restart services ──
+# ── 4b. Activate klipper config in runtime directory ──
+echo ">> Activating extended klipper configs..."
+ssh_cmd "cp -f /usr/local/share/firmware-config/extended/klipper/05_filament_tag.cfg \
+    /oem/printer_data/config/extended/klipper/05_filament_tag.cfg && \
+    chown lava:lava /oem/printer_data/config/extended/klipper/05_filament_tag.cfg"
+echo "   Done."
+
+# ── 5. Inject NTAG write support into fm175xx_reader.py ──
+echo ">> Injecting NTAG write support into fm175xx_reader.py..."
+REMOTE_READER="/home/lava/klipper/klippy/extras/fm175xx_reader.py"
+
+# Extract the Python injector from the build script
+INJECT_SCRIPT="$REPO_DIR/overlays/firmware-extended/68-app-rfid-spools/scripts/01-add-ntag-write.sh"
+sed -n '/^python3 - /,/^PYEOF$/p' "$INJECT_SCRIPT" | \
+  sed '1d;$d' | \
+  tr -d '\r' | \
+  ssh_cmd "cat > /tmp/_inject_ntag_write.py"
+
+if ssh_cmd "grep -q '__reader_a_ntag_page_write' $REMOTE_READER 2>/dev/null"; then
+  echo "   Write methods present — checking for v1 bugs..."
+  # Fix-up: correct {{}} escaping bug and blocking write_ntag_data
+  FIXER=$(mktemp)
+  cat > "$FIXER" << 'FIXEOF'
+import sys, re
+
+path = sys.argv[1]
+with open(path) as f:
+    src = f.read()
+
+changed = False
+
+# Fix 1: {{}} escaping bug (INLINE_CODE was not an f-string)
+for old, new in [
+    ("_ntag_raw_data = {{}}", "_ntag_raw_data = {}"),
+    ("_ntag_write_result = {{'success': True}}", "_ntag_write_result = {'success': True}"),
+    ("_ntag_write_result = {{'success': False, 'error': 'page write failed'}}", "_ntag_write_result = {'success': False, 'error': 'page write failed'}"),
+]:
+    if old in src:
+        src = src.replace(old, new)
+        changed = True
+
+# Fix 2: Remove blocking time.sleep loop from write_ntag_data
+#         (filament_tag.py now polls with reactor.pause instead)
+if 'import time as _time' in src:
+    lines = src.split('\n')
+    start_idx = None
+    end_idx = None
+    for i, line in enumerate(lines):
+        if 'def write_ntag_data(' in line and start_idx is None:
+            start_idx = i
+        elif start_idx is not None and ('def read_ntag_data(' in line or '# Reader-A' in line):
+            end_idx = i
+            break
+
+    if start_idx is not None and end_idx is not None:
+        defline = lines[start_idx]
+        indent = defline[:len(defline) - len(defline.lstrip())]
+        new_method = [
+            indent + 'def write_ntag_data(self, ch, data, start_page=4, retry_times=3):',
+            indent + '    """Queue an NTAG write that executes during the next read cycle."""',
+            indent + '    self._pending_ntag_write = {',
+            indent + "        'ch': ch, 'data': list(data),",
+            indent + "        'start_page': start_page, 'retry_times': retry_times,",
+            indent + '    }',
+            indent + '    self._ntag_write_result = None',
+            indent + '    self.__card_info_read_flag |= (1 << ch)',
+            '',
+        ]
+        lines = lines[:start_idx] + new_method + lines[end_idx:]
+        src = '\n'.join(lines)
+        changed = True
+
+if changed:
+    with open(path, 'w') as f:
+        f.write(src)
+    print("   Fixed v1 injection bugs.")
+else:
+    print("   Already up to date.")
+FIXEOF
+  scp_cmd "$FIXER" "$SSH_HOST:/tmp/_fix_ntag_write.py"
+  rm -f "$FIXER"
+  ssh_cmd "python3 /tmp/_fix_ntag_write.py $REMOTE_READER && rm /tmp/_fix_ntag_write.py"
+else
+  # Fresh injection
+  ssh_cmd "python3 /tmp/_inject_ntag_write.py $REMOTE_READER"
+  echo "   Done."
+fi
+ssh_cmd "rm -f /tmp/_inject_ntag_write.py"
+
+# ── 6. Restart services ──
+echo ">> Restarting rfid-rw API server..."
+ssh_cmd "/etc/init.d/S98rfid-rw-api restart" || true
+
 echo ">> Restarting firmware-config (new actions YAML)..."
 ssh_cmd "/etc/init.d/S99firmware-config restart" || ssh_cmd "killall -HUP firmware-config.py" || true
 
