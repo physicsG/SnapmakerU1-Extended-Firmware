@@ -8,7 +8,7 @@ import {
     TT_OFF_COLOR_R, TT_OFF_COLOR_G, TT_OFF_COLOR_B, TT_OFF_COLOR_A,
     TT_OFF_WEIGHT, TT_OFF_UNIT, TT_OFF_HOTEND_MIN, TT_OFF_HOTEND_MAX,
     TT_OFF_DRY_TEMP, TT_OFF_DRY_TIME, TT_OFF_BED_MIN, TT_OFF_BED_MAX,
-    TT_OFF_TIMESTAMP, TT_OFF_TD, TT_OFF_MESSAGE,
+    TT_OFF_TIMESTAMP, TT_OFF_TD, TT_OFF_MESSAGE, TT_MESSAGE_SIZE,
     TT_USER_DATA_SIZE,
 } from './constants.js';
 
@@ -45,7 +45,7 @@ export function encodeTigerTag(f) {
     // bytes 48-95: message (UTF-8, null-padded)
     if (f.message) {
         const enc = new TextEncoder().encode(f.message);
-        const len = Math.min(enc.length, 48);
+        const len = Math.min(enc.length, TT_MESSAGE_SIZE);
         buf.set(enc.subarray(0, len), TT_OFF_MESSAGE);
     }
     return buf;
@@ -82,9 +82,9 @@ export function decodeTigerTag(raw, opts) {
 }
 
 function decodeMessage(ud) {
-    // bytes 48-95: UTF-8 message, null-terminated
+    // bytes 48-75: UTF-8 message, null-terminated
     let end = TT_OFF_MESSAGE;
-    while (end < TT_USER_DATA_SIZE && ud[end] !== 0) end++;
+    while (end < TT_OFF_MESSAGE + TT_MESSAGE_SIZE && ud[end] !== 0) end++;
     if (end === TT_OFF_MESSAGE) return '';
     return new TextDecoder().decode(ud.slice(TT_OFF_MESSAGE, end));
 }

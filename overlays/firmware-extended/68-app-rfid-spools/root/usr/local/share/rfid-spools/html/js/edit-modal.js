@@ -2,10 +2,20 @@
 // Edit TigerTag modal — mapper, form population, write
 // ─────────────────────────────────────────────────────────────
 import { state, editTagCtx, editTagRaw, setEditTagCtx, setEditTagRaw } from './state.js';
-import { TT_TAG_ID_MAKER, TT_EPOCH, TT_MATERIALS, TT_BRANDS, TT_ASPECTS, TT_DIAMETERS, SM_API } from './constants.js';
+import { TT_TAG_ID_MAKER, TT_EPOCH, TT_MATERIALS, TT_BRANDS, TT_ASPECTS, TT_DIAMETERS, TT_MESSAGE_SIZE, SM_API } from './constants.js';
 import { $, escHtml, showMsg, closeModal, mfDateToISO, moonFetch, smFetch } from './utils.js';
 import { encodeTigerTag, decodeTigerTag } from './tigertag.js';
 import { matchChannel } from './data.js';
+
+// ── Field limit initialization ──
+const etMessageInput = $('et-message');
+const etMessageLimit = $('et-message-limit');
+if (etMessageInput) {
+    etMessageInput.maxLength = TT_MESSAGE_SIZE;
+}
+if (etMessageLimit) {
+    etMessageLimit.textContent = `(max ${TT_MESSAGE_SIZE} characters — filament name)`;
+}
 
 // ── Dropdown population ──
 function populateSelect(id, items, valueFn, labelFn, selectedValue) {
@@ -198,6 +208,12 @@ function populateEditFields(ch, decoded) {
         banner.className = 'mapping-banner ok';
         banner.style.display = '';
     }
+}
+
+// ── Initialize edit-text field limits from constants ──
+const etMessageField = $('et-message');
+if (etMessageField) {
+    etMessageField.maxLength = TT_MESSAGE_SIZE;
 }
 
 // ── Open edit tag modal ──

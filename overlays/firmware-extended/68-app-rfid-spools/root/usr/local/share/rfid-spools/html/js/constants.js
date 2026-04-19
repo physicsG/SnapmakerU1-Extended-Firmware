@@ -36,7 +36,8 @@ export const TT_OFF_BED_MAX     = 31;  // uint8
 export const TT_OFF_TIMESTAMP   = 32;  // uint32
 export const TT_OFF_TD          = 44;  // uint16
 export const TT_OFF_RESERVED    = 46;  // 2 bytes
-export const TT_OFF_MESSAGE     = 48;  // 48 bytes UTF-8
+export const TT_OFF_MESSAGE     = 48;  // 28 bytes UTF-8
+export const TT_MESSAGE_SIZE    = 28;  // 28 bytes UTF-8
 export const TT_USER_DATA_SIZE  = 96;
 
 // ─────────────────────────────────────────────────────────────
