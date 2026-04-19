@@ -7,6 +7,7 @@
 #
 # Default target: root@192.168.2.242
 # Requires SSH key auth (run ssh-copy-id root@<ip> first).
+# ssh-copy-id root@192.168.2.242
 #
 # Examples:
 #   ./scripts/dev/push-rfid-sync.sh
@@ -27,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 SSH_HOST="${1:-root@192.168.2.242}"
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes"
 
 ssh_cmd() {
   ssh $SSH_OPTS "$SSH_HOST" "$@"
