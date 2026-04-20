@@ -37,6 +37,8 @@
         .btn-secondary:hover:not(:disabled) { background: #666; }
         .btn-warning { background: var(--warning); color: #000; }
         .btn-warning:hover:not(:disabled) { background: #ffa726; }
+        .btn-info { background: var(--info); color: #000; }
+        .btn-info:hover:not(:disabled) { background: #42a5f5; }
         .btn-sm { padding: 5px 10px; font-size: 12px; min-height: 28px; }
 
         /* Input */
@@ -187,6 +189,7 @@
     <h1>
         RFID Spools
         <div class="header-right">
+            <span id="spoolman-counters" style="font-size:12px;color:var(--muted)"></span>
             <span id="badge-moonraker" class="badge badge-muted">&#8857; Moonraker</span>
             <span id="badge-spoolman" class="badge badge-muted">&#8857; Spoolman</span>
             <button class="btn btn-warning btn-sm" id="btn-reread" onclick="rereadTags()">&#128225; Re-read Tags</button>

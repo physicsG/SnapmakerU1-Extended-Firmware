@@ -124,6 +124,11 @@ export async function loadSpools() {
     return Array.isArray(spools) ? spools.filter(s => !s.archived) : [];
 }
 
+export async function loadFilaments() {
+    const filaments = await smFetch(SM_API + '/filament');
+    return Array.isArray(filaments) ? filaments : [];
+}
+
 export async function loadActiveSpool() {
     try {
         const d = await moonFetch('/server/spoolman/status');

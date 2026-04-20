@@ -3,13 +3,13 @@
 // ─────────────────────────────────────────────────────────────
 import { state }                   from './state.js';
 import { $, escHtml, authHeaders, closeModal } from './utils.js';
-import { loadChannels, loadSpools, loadActiveSpool } from './data.js';
+import { loadChannels, loadSpools, loadFilaments, loadActiveSpool } from './data.js';
 import { initConfig, toggleConfig, validateUrl, saveUrl, testProxy, setupSpoolmanFields } from './config.js';
-import { renderGrid, badge }       from './render.js';
-import { setActive, syncChannelToSpoolman, syncAllToSpoolman, doUnlink } from './sync.js';
+import { renderGrid, renderSpoolmanCounters, badge } from './render.js';
+import { setActive, syncChannelToSpoolman, syncAllToSpoolman, pushToSpoolman, doUnlink } from './sync.js';
 import { openImport, syncColorText, syncColorPicker, doImport } from './import-modal.js';
 import { openLink, filterSpools, selectSpool, doLink } from './link-modal.js';
-import { syncEtColorText, syncEtColorPicker, openEditTag, doWriteTag } from './edit-modal.js';
+import { syncEtColorText, syncEtColorPicker, openEditTag, doWriteTag, pullFromSpoolman } from './edit-modal.js';
 import { toggleLog, pollOnce, fetchOpenRfidLog, fetchKlipperLog, copyLog, clearLog, toggleAutoPoll } from './debug.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -33,17 +33,20 @@ async function refreshAll() {
 
     if (state.spoolmanUrl) {
         try {
-            state.spools = await loadSpools();
+            [state.spools, state.filaments] = await Promise.all([loadSpools(), loadFilaments()]);
             badge('badge-spoolman', true, 'Spoolman');
         } catch (e) {
             badge('badge-spoolman', false, 'Spoolman');
             state.spools = [];
+            state.filaments = [];
         }
     } else {
         state.spools = [];
+        state.filaments = [];
         badge('badge-spoolman', null, 'Spoolman');
     }
 
+    renderSpoolmanCounters();
     renderGrid();
 }
 
@@ -80,13 +83,13 @@ Object.assign(window, {
     // config
     toggleConfig, validateUrl, saveUrl, testProxy, setupSpoolmanFields,
     // sync
-    setActive, syncChannelToSpoolman, syncAllToSpoolman, doUnlink,
+    setActive, syncChannelToSpoolman, syncAllToSpoolman, pushToSpoolman, doUnlink,
     // import modal
     openImport, syncColorText, syncColorPicker, doImport,
     // link modal
     openLink, filterSpools, selectSpool, doLink,
     // edit modal
-    openEditTag, syncEtColorText, syncEtColorPicker, doWriteTag,
+    openEditTag, syncEtColorText, syncEtColorPicker, doWriteTag, pullFromSpoolman,
     // debug
     toggleLog, pollOnce, fetchOpenRfidLog, fetchKlipperLog, copyLog, clearLog, toggleAutoPoll,
 });

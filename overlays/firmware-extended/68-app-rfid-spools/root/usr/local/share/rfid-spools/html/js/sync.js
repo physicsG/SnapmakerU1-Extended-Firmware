@@ -176,6 +176,25 @@ export async function syncAllToSpoolman() {
     }
 }
 
+export async function pushToSpoolman(chIdx) {
+    const ch = state.channels.find(c => c.ch === chIdx);
+    if (!ch || !ch.material) return;
+    const match = matchChannel(ch, state.spools);
+    const diffs = match.spool ? (await import('./data.js')).diffChannelVsSpool(ch, match.spool) : [];
+    const isForce = match.type !== 'none' && diffs.length > 0;
+    const action = match.type === 'none' ? 'create a new spool' : `force-update ${diffs.length} field${diffs.length>1?'s':''} in Spoolman`;
+    if (isForce && !confirm(`This will ${action}:\n${diffs.map(d => `  ${d.field}: "${d.spool}" → "${d.tag}"`).join('\n')}\n\nContinue?`)) return;
+    try {
+        const r = await syncChannelToSpoolman(chIdx);
+        if (r !== 'skip') {
+            const msg = r.spool === 'created' ? `Created spool in Spoolman` : `Synced to Spoolman`;
+            alert(msg);
+        }
+    } catch (e) {
+        alert(`Push failed: ${e.message}`);
+    }
+}
+
 export async function doUnlink(chIdx, spoolId) {
     const ch = state.channels.find(c => c.ch === chIdx);
     if (!ch) return;

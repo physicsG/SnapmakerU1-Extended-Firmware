@@ -5,6 +5,7 @@ export const state = {
     spoolmanUrl: localStorage.getItem('rfid-spoolman-url') || '',
     channels: [],
     spools: [],
+    filaments: [],
     activeSpoolId: null,
 };
 

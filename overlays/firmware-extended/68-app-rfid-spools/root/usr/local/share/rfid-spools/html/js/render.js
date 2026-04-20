@@ -5,6 +5,16 @@ import { state } from './state.js';
 import { $, escHtml, colorDot, formatMfDate } from './utils.js';
 import { matchChannel, diffChannelVsSpool, isNtag, canEditTag } from './data.js';
 
+export function renderSpoolmanCounters() {
+    const el = $('spoolman-counters');
+    if (!el) return;
+    if (!state.spoolmanUrl) {
+        el.textContent = '';
+        return;
+    }
+    el.textContent = `${state.spools.length} spool${state.spools.length !== 1 ? 's' : ''} · ${state.filaments.length} filament${state.filaments.length !== 1 ? 's' : ''}`;
+}
+
 export function renderGrid() {
     const grid = $('channels-grid');
     if (!state.channels.length) {
@@ -85,6 +95,7 @@ function renderCard(ch, match, activeId) {
     let smHtml = '';
     if (ch.material) {
         const hasUrl = !!state.spoolmanUrl;
+        const editable = canEditTag(ch);
         if (!hasUrl) {
             smHtml = `<div class="sm-section"><span style="font-size:12px;color:var(--muted)">Configure Spoolman URL above</span></div>`;
         } else if (match.type === 'none') {
@@ -93,6 +104,7 @@ function renderCard(ch, match, activeId) {
                     <span class="sm-info">Not found in Spoolman</span>
                     <div class="sm-buttons">
                         <button class="btn btn-warning btn-sm" onclick="openImport(${ch.ch})">Import</button>
+                        <button class="btn btn-success btn-sm" onclick="pushToSpoolman(${ch.ch})" title="Quick-push tag data to Spoolman without editing">Push &#9654;</button>
                         <button class="btn btn-secondary btn-sm" onclick="openLink(${ch.ch})">Link</button>
                     </div>
                 </div>
@@ -108,8 +120,11 @@ function renderCard(ch, match, activeId) {
             const setBtnHtml = isActive
                 ? `<span class="badge badge-ok" style="align-self:center">Active</span>`
                 : `<button class="btn btn-primary btn-sm" onclick="setActive(${s.id},${ch.ch})">Set active</button>`;
-            const syncBtnHtml = diffs.length
-                ? `<button class="btn btn-warning btn-sm" onclick="syncChannelToSpoolman(${ch.ch})">Sync</button>`
+            const pushBtnHtml = diffs.length
+                ? `<button class="btn btn-warning btn-sm" onclick="pushToSpoolman(${ch.ch})" title="Force-push tag data to Spoolman, overwriting ${diffs.length} differing field${diffs.length>1?'s':''}">Force Push &#9654;</button>`
+                : `<span class="badge badge-ok" style="font-size:10px">\u2713 Synced</span>`;
+            const pullBtnHtml = editable
+                ? `<button class="btn btn-info btn-sm" onclick="pullFromSpoolman(${ch.ch})" title="Pull Spoolman data into the tag for writing">&#9664; Pull to Tag</button>`
                 : '';
             smHtml = `<div class="sm-section">
                 <div class="sm-row">
@@ -121,7 +136,8 @@ function renderCard(ch, match, activeId) {
                     </div>
                     <div class="sm-buttons">
                         ${setBtnHtml}
-                        ${syncBtnHtml}
+                        ${pushBtnHtml}
+                        ${pullBtnHtml}
                         <button class="btn btn-secondary btn-sm" onclick="openLink(${ch.ch})">Re-link</button>
                         <button class="btn btn-secondary btn-sm" onclick="doUnlink(${ch.ch},${s.id})">Unlink</button>
                     </div>

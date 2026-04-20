@@ -400,3 +400,163 @@ export async function doWriteTag() {
         $('et-confirm').disabled = false;
     }
 }
+
+// ── Pull Spoolman data into tag edit form ──
+function mapSpoolToTigerTag(spool) {
+    const f = spool.filament || {};
+    const v = (f.vendor || {}).name || '';
+    const fe = f.extra || {};
+    const st = f.settings || {};
+    const smText = val => { try { const p = JSON.parse(val); return typeof p === 'string' ? p : val; } catch { return val; } };
+    const subtype = fe.subtype ? smText(fe.subtype) : '';
+
+    // Build a pseudo-channel and reuse mapChannelToTigerTag logic
+    const _fuzzy = new Set(), _unmapped = new Set();
+    const matUpper = (f.material || '').toUpperCase();
+
+    // --- Material ---
+    let mat = subtype
+        ? TT_MATERIALS.find(m => m.l.toUpperCase() === `${matUpper} ${subtype.toUpperCase()}`)
+          || TT_MATERIALS.find(m => m.l.toUpperCase() === `${matUpper}-${subtype.toUpperCase()}`)
+        : null;
+    if (!mat) mat = TT_MATERIALS.find(m => m.t.toUpperCase() === matUpper && m.l === m.t);
+    if (!mat) mat = TT_MATERIALS.find(m => m.t.toUpperCase() === matUpper);
+    if (!mat && matUpper.length >= 2) {
+        mat = TT_MATERIALS.find(m => m.l.toUpperCase().includes(matUpper));
+        if (mat) _fuzzy.add('material');
+    }
+    if (!mat && f.material) _unmapped.add('material');
+
+    // --- Brand ---
+    let brand = v ? TT_BRANDS.find(b => b.n.toLowerCase() === v.toLowerCase()) : null;
+    if (!brand && v) {
+        brand = TT_BRANDS.find(b =>
+            b.n.toLowerCase().includes(v.toLowerCase()) ||
+            v.toLowerCase().includes(b.n.toLowerCase()));
+        if (brand) _fuzzy.add('brand');
+    }
+    if (!brand && v) _unmapped.add('brand');
+
+    // --- Aspect 1 (from subtype) ---
+    let asp1 = null;
+    if (subtype) {
+        asp1 = TT_ASPECTS.find(a => a.l.toLowerCase() === subtype.toLowerCase());
+        if (!asp1) {
+            asp1 = TT_ASPECTS.find(a => a.i !== 255 && (
+                a.l.toLowerCase().includes(subtype.toLowerCase()) ||
+                subtype.toLowerCase().includes(a.l.toLowerCase())));
+            if (asp1) _fuzzy.add('aspect1');
+        }
+        if (!asp1 && mat && !mat.l.toUpperCase().includes(subtype.toUpperCase()))
+            _unmapped.add('aspect1');
+    }
+
+    // --- Diameter ---
+    const diamMm = f.diameter || 1.75;
+    const diamHundredths = Math.round(diamMm * 100);
+    const diam = TT_DIAMETERS.find(d => Math.abs(parseFloat(d.l) * 100 - diamHundredths) < 5);
+
+    // --- Color ---
+    const rgb = f.color_hex ? f.color_hex.toUpperCase() : '';
+    const mfgDate = fe.mfg_date ? smText(fe.mfg_date) : '';
+
+    return {
+        materialId: mat ? mat.i : 65535,
+        brandId:    brand ? brand.i : 65535,
+        aspect1Id:  asp1 ? asp1.i : 255,
+        aspect2Id:  255,
+        diameterId: diam ? diam.i : 56,
+        weight:     spool.initial_weight || f.weight || '',
+        hotendMin:  fe.hotend_min_temp || '',
+        hotendMax:  st.extruder_temp || '',
+        bedTempMin: '',
+        bedTempMax: st.bed_temp || '',
+        dryingTemp: fe.drying_temp || '',
+        dryingTime: fe.drying_time || '',
+        td:         fe.td || '',
+        colorHex:   (rgb + 'FF').toUpperCase(),
+        colorRgb:   rgb,
+        mfDate:     mfgDate,
+        message:    f.name || [v, f.material, subtype].filter(Boolean).join(' '),
+        _fuzzy, _unmapped,
+    };
+}
+
+export async function pullFromSpoolman(chIdx) {
+    const ch = state.channels.find(c => c.ch === chIdx);
+    if (!ch) return;
+    const match = matchChannel(ch, state.spools);
+    if (!match.spool) { alert('No matched Spoolman spool to pull from'); return; }
+
+    setEditTagCtx(ch);
+    setEditTagRaw(null);
+
+    $('edit-tag-title').textContent = `Pull from Spoolman \u2014 Channel ${chIdx}`;
+    $('et-status').className = 'status-msg';
+    $('et-confirm').disabled = false;
+    $('et-confirm').textContent = '\u270e Write to Tag';
+
+    // Map Spoolman data to TigerTag form
+    const mapped = mapSpoolToTigerTag(match.spool);
+    clearFieldHints();
+
+    populateSelect('et-material', TT_MATERIALS, m => m.i, m => m.l, mapped.materialId);
+    populateSelect('et-brand', TT_BRANDS, b => b.i, b => b.n, mapped.brandId);
+    populateSelect('et-aspect1', TT_ASPECTS, a => a.i, a => a.l, mapped.aspect1Id);
+    populateSelect('et-aspect2', TT_ASPECTS, a => a.i, a => a.l, mapped.aspect2Id);
+    populateSelect('et-diameter', TT_DIAMETERS, d => d.i, d => d.l + ' mm', mapped.diameterId);
+
+    $('et-weight').value     = mapped.weight;
+    $('et-hotend-min').value = mapped.hotendMin;
+    $('et-hotend-max').value = mapped.hotendMax;
+    $('et-bed-min').value    = mapped.bedTempMin;
+    $('et-bed-max').value    = mapped.bedTempMax;
+    $('et-dry-temp').value   = mapped.dryingTemp;
+    $('et-dry-time').value   = mapped.dryingTime;
+    $('et-td').value         = mapped.td;
+
+    $('et-color').value = mapped.colorHex;
+    if (mapped.colorRgb.length === 6) $('et-color-picker').value = '#' + mapped.colorRgb;
+    $('et-mfg-date').value = mapped.mfDate;
+    $('et-message').value = mapped.message;
+
+    for (const f of mapped._fuzzy)    setFieldHint('et-' + f, 'fuzzy');
+    for (const f of mapped._unmapped) setFieldHint('et-' + f, 'unmapped');
+
+    const banner = $('et-mapping-banner');
+    const spoolName = (match.spool.filament || {}).name || `Spool #${match.spool.id}`;
+    if (mapped._unmapped.size > 0) {
+        banner.textContent = `\u26a0 Pulling from "${spoolName}" \u2014 some fields could not be mapped`;
+        banner.className = 'mapping-banner warn';
+    } else if (mapped._fuzzy.size > 0) {
+        banner.textContent = `\u2139 Pulling from "${spoolName}" \u2014 verify highlighted fields`;
+        banner.className = 'mapping-banner warn';
+    } else {
+        banner.textContent = `\u2713 Pulling from "${spoolName}" \u2014 all fields mapped`;
+        banner.className = 'mapping-banner ok';
+    }
+    banner.style.display = '';
+
+    $('edit-tag-modal').classList.add('visible');
+
+    // Read physical tag for raw bytes (preserves non-edited fields when writing)
+    try {
+        showMsg('et-status', '\u23f3 Reading tag\u2026', 'info');
+        const rr = await fetch('/rfid-spools/api/read', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ channel: chIdx }),
+        });
+        const rj = await rr.json();
+        if (rj.ok && rj.hex) {
+            const bytes = new Uint8Array(rj.hex.match(/.{2}/g).map(h => parseInt(h, 16)));
+            setEditTagRaw(bytes);
+            showMsg('et-status', '\u2713 Tag read \u2014 form populated from Spoolman', 'ok');
+        } else {
+            showMsg('et-status', '\u2139 Form populated from Spoolman \u2014 could not read tag', 'info');
+        }
+        setTimeout(() => { $('et-status').className = 'status-msg'; }, 2500);
+    } catch {
+        $('et-status').className = 'status-msg';
+    }
+}
