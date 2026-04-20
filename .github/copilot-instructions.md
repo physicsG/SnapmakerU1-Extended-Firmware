@@ -1,14 +1,5 @@
 # AI Agent Rules for Snapmaker U1 Extended Firmware
 
-## AI Agent Workflow
-
-- ALWAYS USE #askUser TOOL FOR ANY REPLY, RESPONSE, SUMMARY OR ANY INTENTION TO END THE SESSION, THIS IS COMPULSORY!
-- When the task requires multiple steps or non-trivial changes, present a detailed plan using #planReview and wait for approval before executing.
-- If the plan is rejected, incorporate the comments and submit an updated plan with #planReview.
-- When the user asks for a step-by-step guide or walkthrough, present it using #walkthroughReview.
-- Always use #askUser before completing any task to confirm the result matches what the user asked for.
-- Whenever a bug fix or feature implementation is completed and manually tested, create appropriate tests to cover the changes made.
-
 ## Project Overview
 
 This repository builds custom firmware for the Snapmaker U1 3D printer using a modular overlay system. It extends the stock firmware with debug tools, SSH access, Klipper support, camera apps, and other device-specific enhancements.
