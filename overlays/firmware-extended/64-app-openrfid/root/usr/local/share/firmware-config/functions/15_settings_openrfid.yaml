@@ -28,3 +28,33 @@ settings:
                 /etc/init.d/S99openrfid restart
                 /etc/init.d/S60klipper restart
                 echo Please read the relevant documentation for this feature. Bambu Lab and Creality spools are not enabled by default.
+      rfid_write:
+        label: RFID Tag Writing
+        description: |
+          Allow the OpenRFID Moonraker agent to write to NTAG215 tags.
+          Required by the rfid-spools UI's Write/Clear/Edit actions.
+          Off by default; enable only when you intend to author tags.
+        get_cmd:
+          - bash
+          - -c
+          - /usr/local/bin/extended-config.py get /oem/printer_data/config/extended/extended2.cfg components rfid_write false
+        options:
+          'true':
+            label: Enabled
+            confirm: "Enable RFID tag writing? The Spools UI will surface Write / Clear / Edit buttons for NTAG215 tags."
+            cmd:
+              - bash
+              - -xc
+              - |
+                /usr/local/bin/extended-config.py add /oem/printer_data/config/extended/extended2.cfg components rfid_write true
+                /etc/init.d/S99openrfid restart
+          'false':
+            label: Disabled
+            confirm: "Disable RFID tag writing? The Spools UI will hide Write / Clear / Edit buttons; the agent will refuse write requests."
+            cmd:
+              - bash
+              - -xc
+              - |
+                /usr/local/bin/extended-config.py add /oem/printer_data/config/extended/extended2.cfg components rfid_write false
+                /etc/init.d/S99openrfid restart
+        default: 'false'

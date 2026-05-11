@@ -92,6 +92,12 @@ Static-only: redirects `/spools` → `/spools/`, then serves the SPA from
 `/usr/local/share/rfid-spools/html/` behind the same `auth_request` guard
 the rest of the firmware uses. No reverse proxy.
 
+It also exposes the OpenRFID-shipped TigerTag JSON registry under
+`/spools/static/openrfid/database/` (alias of
+`/usr/local/share/openrfid/tag/tigertag/database/`, cached for one hour)
+so the in-browser TigerTag encoder can resolve `id_material.json`,
+`id_brand.json`, etc. without an API round-trip.
+
 ## Related Klipper patches — [../13-patch-rfid/patches/](../13-patch-rfid/patches/)
 
 - `01-add-ntag215-support.patch`

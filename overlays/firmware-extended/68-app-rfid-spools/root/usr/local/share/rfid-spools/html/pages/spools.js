@@ -5,12 +5,16 @@
 
 var SpoolsPage = (function () {
 
-    var _sse = null;
-    var _spoolmanCache = {};           // channel → {name, density, filament_id}
+    var _unsubscribeScan = null;       // OpenRfid.onScan unsubscribe handle
+    var _unsubscribeStatus = null;     // notify_status_update unsubscribe handle
+    var _spoolmanCache = {};           // channel → filament record
     var _spoolmanFetchPending = false; // prevents overlapping refresh batches
-    var _tigertagRegistry = null;      // cached TigerTag DB ({materials, brands, ...})
-    var _registryFetchInflight = null; // in-flight Promise for registry fetch
     var _editingChannels = {};         // channel → true if user is editing inline
+    var _writeEnabled = false;         // mirrors openrfid/list_channels.write_enabled
+    var _filamentDetect = {};          // last printer.objects.query result for filament_detect
+    var _channels = [];                // last openrfid/list_channels.channels (per-slot)
+    var _spoolListCache = null;        // {ts, items, truncated, archived}
+    var _SPOOL_LIST_TTL_MS = 60 * 1000;
 
     // Density defaults (g/cm³) by material type — mirrors backend MATERIAL_DENSITY table.
     var DENSITY_DEFAULTS = {
@@ -264,7 +268,12 @@ var SpoolsPage = (function () {
             uidByteLen = Math.floor(uidVal.replace(/[^0-9a-fA-F]/g, '').length / 2);
         }
         var isWritable = uidByteLen === 7;
-        if (isWritable) {
+        // Hide all write/clear/edit affordances when the firmware-config
+        // toggle (`components.rfid_write`) is off — that's the master kill
+        // switch piped through to openrfid_api.enable_write. The agent
+        // would refuse the call anyway, but suppressing the buttons keeps
+        // the UI honest about what's available.
+        if (isWritable && _writeEnabled) {
             if (isUnrecognized) {
                 // Blank tag: 3-button action group — write defaults, pick a
                 // Spoolman spool, or enter a spool ID directly.
@@ -372,7 +381,7 @@ var SpoolsPage = (function () {
             var onboardLink = Templates.$(onboardFooter, '[data-id="link"]');
             onboardLink.addEventListener('click', function (e) {
                 e.preventDefault();
-                App.navigate('config');
+                App.navigate('config-spoolman');
             });
             footers.appendChild(onboardFooter);
         }
@@ -383,23 +392,7 @@ var SpoolsPage = (function () {
     // ── TigerTag inline edit / write helpers ───────────────────────────────
 
     function ensureRegistry() {
-        if (_tigertagRegistry) return Promise.resolve(_tigertagRegistry);
-        if (_registryFetchInflight) return _registryFetchInflight;
-        _registryFetchInflight = fetch('/spools/api/tigertag/registry')
-            .then(function (r) {
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                return r.json();
-            })
-            .then(function (data) {
-                _tigertagRegistry = data;
-                _registryFetchInflight = null;
-                return data;
-            })
-            .catch(function (err) {
-                _registryFetchInflight = null;
-                throw err;
-            });
-        return _registryFetchInflight;
+        return TigerTag.loadRegistry();
     }
 
     function _selectFromRegistry(records, currentLabel, placeholder) {
@@ -680,19 +673,48 @@ var SpoolsPage = (function () {
         var refresh = Templates.$(overlay, '[data-id="refresh"]');
         refresh.classList.add('spinning');
 
-        var qs = [];
-        if (_pickerState.archived) qs.push('include_archived=true');
-        if (forceRefresh) qs.push('refresh=true');
-        var url = '/spools/api/spoolman-spools' + (qs.length ? '?' + qs.join('&') : '');
+        // Serve from the in-memory cache if it's fresh enough and the
+        // archived flag matches. The deleted backend used a 60 s server-side
+        // cache; we replicate that on the client so opening the picker stays
+        // snappy without hammering Spoolman.
+        var now = Date.now();
+        var c = _spoolListCache;
+        if (!forceRefresh && c && c.archived === _pickerState.archived
+                && (now - c.ts) < _SPOOL_LIST_TTL_MS) {
+            _pickerState.spools = c.items;
+            _pickerState.truncated = c.truncated;
+            var banner = Templates.$(overlay, '[data-id="truncated-banner"]');
+            banner.hidden = !_pickerState.truncated;
+            _renderPickerList();
+            _setPickerStatus('', false);
+            refresh.classList.remove('spinning');
+            return;
+        }
 
-        fetch(url)
-            .then(function (r) {
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                return r.json();
-            })
-            .then(function (data) {
-                _pickerState.spools = (data && data.items) || [];
-                _pickerState.truncated = !!(data && data.truncated);
+        var params = {};
+        if (_pickerState.archived) params.allow_archived = true;
+
+        Spoolman.listSpools(params)
+            .then(function (items) {
+                if (!Array.isArray(items)) items = [];
+                // Cap at 1000 so an enormous library doesn't blow up the
+                // picker grid; the search filter handles narrower sets.
+                var truncated = false;
+                if (items.length > 1000) {
+                    items = items.slice(0, 1000);
+                    truncated = true;
+                }
+                // Flatten the nested filament/vendor relations onto the
+                // spool record itself so the search/sort code stays simple.
+                var thinned = items.map(_thinSpool);
+                _spoolListCache = {
+                    ts: Date.now(),
+                    items: thinned,
+                    truncated: truncated,
+                    archived: _pickerState.archived
+                };
+                _pickerState.spools = thinned;
+                _pickerState.truncated = truncated;
                 var banner = Templates.$(overlay, '[data-id="truncated-banner"]');
                 banner.hidden = !_pickerState.truncated;
                 _renderPickerList();
@@ -705,6 +727,34 @@ var SpoolsPage = (function () {
             .then(function () {
                 refresh.classList.remove('spinning');
             });
+    }
+
+    // Flatten Spoolman's nested record into the shape the picker UI expects.
+    function _thinSpool(spool) {
+        var fil = spool.filament || {};
+        var ven = fil.vendor || {};
+        var color = fil.color_hex || spool.color_hex || null;
+        if (color && color.charAt(0) !== '#') color = '#' + color;
+        var weight = (typeof spool.initial_weight === 'number') ? spool.initial_weight
+                   : (typeof spool.weight === 'number') ? spool.weight
+                   : (typeof fil.weight === 'number') ? fil.weight
+                   : null;
+        return {
+            id: spool.id,
+            name: spool.lot_nr || spool.name || fil.name || '',
+            external_id: spool.external_id || '',
+            archived: !!spool.archived,
+            color_hex: color,
+            weight_g: weight,
+            vendor: ven.name || '',
+            material: fil.material || '',
+            // Keep the originals around so _useSpoolId can re-fetch the
+            // expanded record without another round trip when the user
+            // selects this row.
+            _filament: fil,
+            _vendor: ven,
+            _spool: spool
+        };
     }
 
     // Filter terms are matched as ANDed substrings against a single
@@ -807,16 +857,30 @@ var SpoolsPage = (function () {
         var target = _pickerState.target;
         if (!target) return;
         _setPickerStatus('Loading spool #' + spoolId + '…', false);
-        fetch('/spools/api/spoolman-spool/' + encodeURIComponent(spoolId) + '/tigertag-spec')
-            .then(function (r) {
-                if (!r.ok) {
-                    return r.text().then(function (t) {
-                        throw new Error('HTTP ' + r.status + (t ? ': ' + t : ''));
-                    });
+
+        // Try the cached thin row first (already includes the embedded
+        // filament/vendor) so we can fast-path the common picker click;
+        // fall back to a full GET so by-id entries (which may not be in
+        // the cache) still resolve.
+        var cached = null;
+        if (Array.isArray(_pickerState.spools)) {
+            for (var i = 0; i < _pickerState.spools.length; i++) {
+                if (_pickerState.spools[i].id === spoolId) {
+                    cached = _pickerState.spools[i];
+                    break;
                 }
-                return r.json();
-            })
-            .then(function (spec) {
+            }
+        }
+        var p = cached
+            ? Promise.resolve(cached._spool)
+            : Spoolman.getSpool(spoolId);
+
+        p.then(function (spool) {
+                var spec = TigerTag.spoolToSpec(spool, spool && spool.filament,
+                    (spool && spool.filament) ? spool.filament.vendor : null);
+                // Stash the spool id so the editor can later record the link
+                // back into the Moonraker DB on a successful write.
+                spec._source_spool_id = spoolId;
                 _closeSpoolPicker();
                 ensureRegistry().then(function (reg) {
                     enterEditMode(target.card, target.ch, target.config, spec, reg, true);
@@ -1083,45 +1147,49 @@ var SpoolsPage = (function () {
         statusEl.textContent = '';
         statusEl.className = 'channel-edit-status';
 
-        fetch('/spools/api/write', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ channel: channel, spec: spec })
-        })
-            .then(function (resp) {
-                return resp.json().then(function (body) {
-                    return { ok: resp.ok, status: resp.status, body: body };
-                });
+        function reset() {
+            writeBtn.disabled = false;
+            cancelBtn.disabled = false;
+            writeBtn.textContent = origText;
+        }
+
+        // Two-step write: ask the agent to encode the spec into the 96-byte
+        // TigerTag payload, then push the resulting hex to the chosen slot.
+        // The encoder runs upstream because it's the source of truth for the
+        // wire format; the SPA never touches struct packing.
+        var openrfid = App.openrfid();
+        openrfid.tigertagEncode(spec)
+            .then(function (encoded) {
+                if (!encoded || encoded.ok === false) {
+                    var msg = (encoded && (encoded.error || encoded.message)) || 'encode failed';
+                    throw new Error(msg);
+                }
+                var hex = encoded.data_hex || encoded.hex || encoded.data;
+                if (!hex) throw new Error('encoder returned no data_hex');
+                return openrfid.writeTag(channel, hex);
             })
             .then(function (res) {
-                writeBtn.disabled = false;
-                cancelBtn.disabled = false;
-                writeBtn.textContent = origText;
-                var b = res.body || {};
-                if (res.ok && b.state === 'success') {
+                reset();
+                var ok = res && (res.ok === true || res.state === 'success');
+                if (ok) {
                     statusEl.textContent = '✓ Written';
                     statusEl.className = 'channel-edit-status channel-edit-ok';
-                    // Exit edit mode after a short delay
-                    setTimeout(function () {
-                        _closeEditModal();
-                    }, 800);
+                    setTimeout(function () { _closeEditModal(); }, 800);
                 } else {
-                    var msg = b.message || b.error || ('HTTP ' + res.status);
-                    statusEl.textContent = '✗ ' + msg;
+                    var emsg = (res && (res.error || res.message)) || 'write failed';
+                    statusEl.textContent = '✗ ' + emsg;
                     statusEl.className = 'channel-edit-status channel-edit-err';
                 }
             })
             .catch(function (err) {
-                writeBtn.disabled = false;
-                cancelBtn.disabled = false;
-                writeBtn.textContent = origText;
+                reset();
                 statusEl.textContent = '✗ ' + err.message;
                 statusEl.className = 'channel-edit-status channel-edit-err';
             });
     }
 
-    // Erase the user-data area of an NTAG215 by submitting an all-zero spec
-    // payload through the existing /api/clear endpoint.
+    // Erase the user-data area of an NTAG215 by asking the OpenRFID agent
+    // to write 24 zero pages (96 bytes) starting at the user-data page.
     function clearTag(channel, clearBtn, writeBtn, cancelBtn, statusEl) {
         clearBtn.disabled = true;
         writeBtn.disabled = true;
@@ -1131,39 +1199,29 @@ var SpoolsPage = (function () {
         statusEl.textContent = '';
         statusEl.className = 'channel-edit-status';
 
-        fetch('/spools/api/clear', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ channel: channel })
-        })
-            .then(function (resp) {
-                return resp.json().then(function (body) {
-                    return { ok: resp.ok, status: resp.status, body: body };
-                });
-            })
+        function reset() {
+            clearBtn.disabled = false;
+            writeBtn.disabled = false;
+            cancelBtn.disabled = false;
+            clearBtn.textContent = origText;
+        }
+
+        App.openrfid().clearTag(channel)
             .then(function (res) {
-                clearBtn.disabled = false;
-                writeBtn.disabled = false;
-                cancelBtn.disabled = false;
-                clearBtn.textContent = origText;
-                var b = res.body || {};
-                if (res.ok && b.state === 'success') {
+                reset();
+                var ok = res && (res.ok === true || res.state === 'success');
+                if (ok) {
                     statusEl.textContent = '\u2713 Cleared';
                     statusEl.className = 'channel-edit-status channel-edit-ok';
-                    setTimeout(function () {
-                        _closeEditModal();
-                    }, 800);
+                    setTimeout(function () { _closeEditModal(); }, 800);
                 } else {
-                    var msg = b.message || b.error || ('HTTP ' + res.status);
-                    statusEl.textContent = '\u2717 ' + msg;
+                    var emsg = (res && (res.error || res.message)) || 'clear failed';
+                    statusEl.textContent = '\u2717 ' + emsg;
                     statusEl.className = 'channel-edit-status channel-edit-err';
                 }
             })
             .catch(function (err) {
-                clearBtn.disabled = false;
-                writeBtn.disabled = false;
-                cancelBtn.disabled = false;
-                clearBtn.textContent = origText;
+                reset();
                 statusEl.textContent = '\u2717 ' + err.message;
                 statusEl.className = 'channel-edit-status channel-edit-err';
             });
@@ -1175,83 +1233,156 @@ var SpoolsPage = (function () {
         btn.textContent = 'Syncing\u2026';
         statusEl.textContent = '';
         statusEl.className = 'spoolman-sync-status';
+
         var density = parseFloat(densityInput.value);
-        var body = { name: nameInput.value.trim(), density: isNaN(density) ? 1.24 : density };
-        if (filamentId) body.filament_id = filamentId;
-        fetch('/spools/api/spoolman-sync?channel=' + channel, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        })
-            .then(function (resp) {
-                if (!resp.ok) return resp.json().then(function (e) {
-                    var msg = e.error || ('HTTP ' + resp.status);
-                    if (resp.status === 502) {
-                        msg = 'Cannot reach Spoolman \u2014 check the URL in Config';
-                    } else if (resp.status === 400 && (msg.indexOf('uid') !== -1 || msg.indexOf('UID') !== -1)) {
-                        msg = 'Tag has no UID \u2014 cannot link to Spoolman';
-                    }
-                    // For all other errors (including 422) show the actual detail
-                    throw new Error(msg);
+        if (isNaN(density)) density = 1.24;
+
+        // Look up the channel so we can grab the on-tag UID + cached fields
+        // and pass real numbers to Spoolman.
+        var ch = null;
+        for (var i = 0; i < _channels.length; i++) {
+            if (_channels[i].channel === channel) { ch = _channels[i]; break; }
+        }
+        if (!ch) {
+            btn.disabled = false;
+            btn.textContent = originalBtnText;
+            statusEl.textContent = 'No channel data';
+            statusEl.className = 'spoolman-sync-status spoolman-sync-err';
+            return;
+        }
+
+        var f = resolveFields(ch, App.getConfig());
+        var uid = (ch.tag && ch.tag.scan && ch.tag.scan.uid) || (ch.moonraker && ch.moonraker.CARD_UID);
+        var uidStr = Array.isArray(uid) ? formatUid(uid) : (uid ? String(uid) : null);
+        if (!uidStr) {
+            btn.disabled = false;
+            btn.textContent = originalBtnText;
+            statusEl.textContent = 'Tag has no UID \u2014 cannot link to Spoolman';
+            statusEl.className = 'spoolman-sync-status spoolman-sync-err';
+            return;
+        }
+
+        var prevLink = (App.getConfig().slot_spool_links || {})[uidStr];
+
+        // Build the Spoolman payload. We always create a new spool record
+        // when there's no prior link, otherwise patch the existing one so
+        // the link is stable across successive syncs.
+        var color = (function () {
+            var src = f.colors;
+            if (Array.isArray(src) && src.length > 0 && typeof src[0] === 'number') {
+                var argb = src[0];
+                var r = (argb >> 16) & 0xFF, g = (argb >> 8) & 0xFF, b = argb & 0xFF;
+                return ('00' + r.toString(16)).slice(-2)
+                     + ('00' + g.toString(16)).slice(-2)
+                     + ('00' + b.toString(16)).slice(-2);
+            }
+            if (typeof src === 'string') return src.replace(/^#/, '');
+            return null;
+        })();
+
+        var spoolPayload = {
+            initial_weight: (f.weight_grams && f.weight_grams > 0) ? f.weight_grams : 1000,
+            comment: nameInput.value.trim(),
+            extra: { rfid_uid: JSON.stringify(uidStr) }
+        };
+        if (filamentId) spoolPayload.filament_id = filamentId;
+        if (color) spoolPayload.extra.color_hex = JSON.stringify(color);
+
+        var op = prevLink
+            ? Spoolman.updateSpool(prevLink, spoolPayload)
+            : Spoolman.upsertSpool(spoolPayload);
+
+        op.then(function (spool) {
+                // Persist the UID → spool-id link so the next sync patches
+                // instead of creating a new record.
+                var links = Object.assign({}, App.getConfig().slot_spool_links || {});
+                links[uidStr] = spool.id;
+                return App.saveConfig({ slot_spool_links: links }).then(function () {
+                    return spool;
                 });
-                return resp.json();
             })
-            .then(function (data) {
+            .then(function (spool) {
+                // Tell Klipper a filament change happened so it can refresh
+                // its [filament_detect] info — same gcode the deleted backend
+                // used. Failures here are non-fatal (the macro may not exist
+                // on every install).
+                return App.moonraker().call('printer.gcode.script', {
+                    script: 'FILAMENT_DT_UPDATE CHANNEL=' + channel
+                }).catch(function (err) {
+                    console.warn('FILAMENT_DT_UPDATE failed:', err && err.message);
+                }).then(function () { return spool; });
+            })
+            .then(function (spool) {
                 btn.disabled = false;
                 btn.textContent = originalBtnText;
-                statusEl.textContent = data.created_filament ? 'Created \u2713' : 'Updated \u2713';
+                statusEl.textContent = prevLink ? 'Updated \u2713' : 'Created \u2713';
                 statusEl.className = 'spoolman-sync-status spoolman-sync-ok';
-                // Invalidate Spoolman cache for this channel and refresh cards
                 delete _spoolmanCache[channel];
                 fetchChannels();
+                return spool;
             })
             .catch(function (err) {
                 btn.disabled = false;
                 btn.textContent = originalBtnText;
-                statusEl.textContent = err.message;
+                var msg = (err && err.message) || 'sync failed';
+                if (err && err.status === 422) {
+                    msg = 'Spoolman rejected the data \u2014 if you use extra fields, register them first in Config';
+                }
+                statusEl.textContent = msg;
                 statusEl.className = 'spoolman-sync-status spoolman-sync-err';
             });
     }
 
     function refreshSpoolmanCache(channels) {
         if (_spoolmanFetchPending) return;
+        // Build the list of (channel, filament_id) pairs we still need to
+        // resolve. The backing data here is the on-tag UID → stored
+        // spool-id link; we resolve that into a Spoolman filament record so
+        // the card body can show the linked filament name/density.
+        var links = (App.getConfig().slot_spool_links || {});
         var toFetch = [];
         for (var i = 0; i < channels.length; i++) {
             var ch = channels[i];
-            var ss = ch.spoolman_sync;
-            if (!ss || !ss.filament_id) continue;
+            var uid = (ch.tag && ch.tag.scan && ch.tag.scan.uid) || (ch.moonraker && ch.moonraker.CARD_UID);
+            var uidStr = Array.isArray(uid) ? formatUid(uid) : (uid ? String(uid) : null);
+            if (!uidStr) continue;
+            var spoolId = links[uidStr];
+            if (!spoolId) continue;
             var cached = _spoolmanCache[ch.channel];
-            if (cached && cached.filament_id === ss.filament_id) continue;  // cache hit
-            toFetch.push(ch.channel);
+            if (cached && cached.spool_id === spoolId) continue;
+            toFetch.push({ channel: ch.channel, spoolId: spoolId });
         }
         if (toFetch.length === 0) return;
         _spoolmanFetchPending = true;
         var remaining = toFetch.length;
         var needRerender = false;
-        toFetch.forEach(function (channelIdx) {
-            fetch('/spools/api/spoolman-filament?channel=' + channelIdx)
-                .then(function (r) {
-                    if (r.status === 404) {
-                        delete _spoolmanCache[channelIdx];
+        toFetch.forEach(function (entry) {
+            Spoolman.getSpool(entry.spoolId)
+                .then(function (spool) {
+                    var fil = (spool && spool.filament) || null;
+                    if (fil) {
+                        _spoolmanCache[entry.channel] = {
+                            spool_id: entry.spoolId,
+                            filament_id: fil.id,
+                            name: fil.name || ('Spool #' + entry.spoolId),
+                            density: fil.density || null
+                        };
                         needRerender = true;
-                        return null;
-                    }
-                    return r.ok ? r.json() : null;
-                })
-                .then(function (data) {
-                    if (data) {
-                        _spoolmanCache[channelIdx] = data;
+                    } else {
+                        delete _spoolmanCache[entry.channel];
                         needRerender = true;
-                    }
-                    remaining--;
-                    if (remaining === 0) {
-                        _spoolmanFetchPending = false;
-                        if (needRerender) fetchChannels();
                     }
                 })
-                .catch(function () {
-                    _spoolmanCache[channelIdx] = { error: true };
-                    needRerender = true;
+                .catch(function (err) {
+                    if (err && err.status === 404) {
+                        delete _spoolmanCache[entry.channel];
+                        needRerender = true;
+                    } else {
+                        _spoolmanCache[entry.channel] = { error: true };
+                        needRerender = true;
+                    }
+                })
+                .then(function () {
                     remaining--;
                     if (remaining === 0) {
                         _spoolmanFetchPending = false;
@@ -1261,37 +1392,67 @@ var SpoolsPage = (function () {
         });
     }
 
-    function startSSE() {
-        if (_sse) return;
-        _sse = new EventSource('/spools/api/events');
-        _sse.addEventListener('tag-event', function () { fetchChannels(); });
-        _sse.addEventListener('tag-removed', function () { fetchChannels(); });
-        _sse.onerror = function () {
-            _sse.close();
-            _sse = null;
-            App.setConnectionStatus(false);
-            // Retry after 5s
-            setTimeout(startSSE, 5000);
-        };
+    // Wire up the two live data sources we care about: OpenRFID scan events
+    // (UID + filament parse) and Klipper's filament_detect printer object
+    // (vendor/material strings). Both call fetchChannels() to repaint.
+    function setupSubscriptions() {
+        var openrfid = App.openrfid();
+        var moonraker = App.moonraker();
+        if (_unsubscribeScan) { _unsubscribeScan(); _unsubscribeScan = null; }
+        if (_unsubscribeStatus) { _unsubscribeStatus(); _unsubscribeStatus = null; }
+
+        _unsubscribeScan = openrfid.onScan(function () { fetchChannels(); });
+
+        // Subscribe to filament_detect updates pushed via notify_status_update.
+        // Moonraker also requires an initial subscribe RPC to register interest.
+        moonraker.call('printer.objects.subscribe', {
+            objects: { filament_detect: null }
+        }).then(function (res) {
+            if (res && res.status && res.status.filament_detect) {
+                _filamentDetect = res.status.filament_detect;
+                fetchChannels();
+            }
+        }).catch(function () {
+            // Filament detect object may not be present; non-fatal.
+        });
+
+        _unsubscribeStatus = moonraker.on('notify_status_update', function (params) {
+            var update = Array.isArray(params) ? params[0] : params;
+            if (!update || !update.filament_detect) return;
+            // Shallow merge so partial updates don't blow away cached fields.
+            _filamentDetect = Object.assign({}, _filamentDetect, update.filament_detect);
+            fetchChannels();
+        });
     }
 
     function fetchSpoolmanStatus(forceRefreshInfoBox) {
-        fetch('/spools/api/spoolman-status')
-            .then(function (r) { return r.ok ? r.json() : null; })
+        Spoolman.status()
             .then(function (data) {
                 var dot = document.getElementById('spoolman-status-dot');
                 var text = document.getElementById('spoolman-status-text');
+                // Moonraker returns {spoolman_connected: bool, ...}; map it
+                // onto the legacy {configured, ok, url, counts} shape the
+                // info-box renderer expects so the rest of the page stays
+                // the same.
+                var configured = !!(data && (data.spoolman_connected !== undefined || data.url));
+                var ok = !!(data && (data.spoolman_connected || data.ok));
+                var normalised = {
+                    configured: configured,
+                    ok: ok,
+                    url: data && data.url,
+                    counts: data && data.counts
+                };
                 if (dot && text) {
-                    if (!data || !data.configured) {
+                    if (!configured) {
                         dot.style.display = 'none';
                         text.style.display = 'none';
                     } else {
                         dot.style.display = '';
                         text.style.display = '';
-                        dot.className = 'status-dot ' + (data.ok ? 'connected' : 'disconnected');
+                        dot.className = 'status-dot ' + (ok ? 'connected' : 'disconnected');
                     }
                 }
-                renderSpoolmanInfoBox(data);
+                renderSpoolmanInfoBox(normalised);
             })
             .catch(function () { /* ignore */ });
     }
@@ -1333,9 +1494,8 @@ var SpoolsPage = (function () {
 
         // Info box lives below the channel grid. Cloned from the template
         // so the markup stays in spools.html. Hidden until the first
-        // /api/spoolman-status response says configured=true.
+        // status response says configured=true.
         var infoBox = Templates.clone('spoolman-info-box');
-        // The template returns the <section> itself; tag it for lookup.
         infoBox.id = 'spoolman-info-section';
         var refreshBtn = infoBox.querySelector('[data-id="refresh"]');
         if (refreshBtn) {
@@ -1348,56 +1508,98 @@ var SpoolsPage = (function () {
         container.appendChild(infoBox);
 
         fetchSpoolmanStatus();
+        setupSubscriptions();
         fetchChannels();
-        startSSE();
         scanAll();  // Trigger a full RFID scan on page open
     }
 
     function unmount() {
-        if (_sse) {
-            _sse.close();
-            _sse = null;
-        }
+        if (_unsubscribeScan) { _unsubscribeScan(); _unsubscribeScan = null; }
+        if (_unsubscribeStatus) { _unsubscribeStatus(); _unsubscribeStatus = null; }
     }
 
     function fetchChannels() {
         var config = App.getConfig();
-        fetch('/spools/api/channels')
-            .then(function (resp) {
-                if (!resp.ok) throw new Error('HTTP ' + resp.status);
-                return resp.json();
-            })
-            .then(function (data) {
-                App.setConnectionStatus(true);
-                var container = document.getElementById('channels');
-                if (!container) return;
-                // Preserve any cards currently in inline-edit mode so SSE updates
-                // don't blow away the user's in-progress changes.
-                var preserved = {};
-                var existing = container.querySelectorAll('.channel-card');
-                for (var p = 0; p < existing.length; p++) {
-                    var chIdx = existing[p].getAttribute('data-channel');
-                    if (chIdx !== null && _editingChannels[chIdx]) {
-                        preserved[chIdx] = existing[p];
-                    }
+        var openrfid = App.openrfid();
+        var moonraker = App.moonraker();
+        // Pull both data sources in parallel: openrfid/list_channels gives
+        // us the per-slot RFID side (uid, tag_type, parsed filament dict)
+        // plus the write-enabled flag, while filament_detect carries the
+        // Klipper-side vendor/material strings the channel card relies on.
+        Promise.all([
+            openrfid.listChannels(),
+            moonraker.call('printer.objects.query', { objects: { filament_detect: null } })
+                .catch(function () { return null; })
+        ]).then(function (results) {
+            App.setConnectionStatus(true);
+            var lc = results[0] || {};
+            var fdResp = results[1] || {};
+            _writeEnabled = !!lc.write_enabled;
+            var fd = (fdResp.status && fdResp.status.filament_detect) || _filamentDetect || {};
+            _filamentDetect = fd;
+
+            var ocChannels = lc.channels || [];
+            var fdInfo = fd.info || [];
+            var merged = mergeChannels(ocChannels, fdInfo);
+            _channels = merged;
+
+            var container = document.getElementById('channels');
+            if (!container) return;
+            // Preserve any cards currently in inline-edit mode so live
+            // updates don't blow away the user's in-progress changes.
+            var preserved = {};
+            var existing = container.querySelectorAll('.channel-card');
+            for (var p = 0; p < existing.length; p++) {
+                var chIdx = existing[p].getAttribute('data-channel');
+                if (chIdx !== null && _editingChannels[chIdx]) {
+                    preserved[chIdx] = existing[p];
                 }
-                container.innerHTML = '';
-                var channels = data.channels || [];
-                for (var i = 0; i < channels.length; i++) {
-                    var key = String(channels[i].channel);
-                    if (preserved[key]) {
-                        container.appendChild(preserved[key]);
-                    } else {
-                        container.appendChild(renderChannel(channels[i], config));
-                    }
+            }
+            container.innerHTML = '';
+            for (var i = 0; i < merged.length; i++) {
+                var key = String(merged[i].channel);
+                if (preserved[key]) {
+                    container.appendChild(preserved[key]);
+                } else {
+                    container.appendChild(renderChannel(merged[i], config));
                 }
-                refreshSpoolmanCache(channels);
-                fetchSpoolmanStatus();
-            })
-            .catch(function (err) {
-                App.setConnectionStatus(false);
-                console.error('Failed to fetch channels:', err);
+            }
+            refreshSpoolmanCache(merged);
+            fetchSpoolmanStatus();
+        }).catch(function (err) {
+            App.setConnectionStatus(false);
+            console.error('Failed to fetch channels:', err);
+        });
+    }
+
+    // Merge the two data sources by slot index. Always emits exactly four
+    // entries (slots 0..3) so the grid layout stays stable even when the
+    // OpenRFID agent only knows about a subset of them.
+    function mergeChannels(ocChannels, fdInfo) {
+        var bySlot = {};
+        for (var i = 0; i < ocChannels.length; i++) {
+            var oc = ocChannels[i];
+            bySlot[oc.slot] = oc;
+        }
+        var out = [];
+        for (var s = 0; s < 4; s++) {
+            var oc2 = bySlot[s];
+            var ls = (oc2 && oc2.last_scan) || null;
+            var tag = null;
+            if (ls) {
+                tag = {
+                    scan: { uid: ls.uid },
+                    filament: ls.filament || null,
+                    unrecognized: !!ls.tag_type && !ls.filament
+                };
+            }
+            out.push({
+                channel: s,
+                moonraker: fdInfo[s] || {},
+                tag: tag
             });
+        }
+        return out;
     }
 
     return { mount: mount, unmount: unmount, fetchChannels: fetchChannels };
@@ -1406,14 +1608,20 @@ var SpoolsPage = (function () {
 function scanAll() {
     var btn = document.getElementById('scan-btn');
     if (btn) { btn.disabled = true; btn.textContent = 'Scanning\u2026'; }
-    fetch('/spools/api/scan', { method: 'POST' })
-        .then(function (resp) { return resp.json(); })
-        .then(function () {
-            // SSE will pick up the tag event; just re-enable the button
-            if (btn) { btn.disabled = false; btn.textContent = 'Scan All'; }
-        })
-        .catch(function (err) {
-            console.error('Scan failed:', err);
-            if (btn) { btn.disabled = false; btn.textContent = 'Scan All'; }
+    var openrfid = App.openrfid();
+    if (!openrfid) {
+        if (btn) { btn.disabled = false; btn.textContent = 'Scan All'; }
+        return;
+    }
+    // Trigger one scan per slot in parallel. The agent broadcasts the
+    // results via notify_agent_event, which our subscription picks up
+    // and turns into fetchChannels() repaints.
+    Promise.all([0, 1, 2, 3].map(function (slot) {
+        return openrfid.scanSlot(slot).catch(function (err) {
+            console.warn('Scan slot ' + slot + ' failed:', err && err.message);
+            return null;
         });
+    })).then(function () {
+        if (btn) { btn.disabled = false; btn.textContent = 'Scan All'; }
+    });
 }

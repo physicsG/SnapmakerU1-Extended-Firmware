@@ -17,8 +17,17 @@ if [[ ! -d "$TARGET_DIR" ]]; then
 elif [[ -n "$CI" ]]; then
   echo ">> CI environment detected. Forcing the git repository to be re-fetched."
 else
-  echo ">> Using cached git repository in $TARGET_DIR"
-  exit 0
+  # The cache exists. Only reuse it as-is when HEAD already matches the
+  # requested SHA — otherwise a stale checkout silently shadows a bumped
+  # GIT_SHA and the resulting firmware ships with old code (see the
+  # OpenRFID overlay reinstall problem). Resolve and compare full SHAs.
+  REQUESTED_SHA=$(git -C "$TARGET_DIR" rev-parse --verify "$GIT_SHA^{commit}" 2>/dev/null || true)
+  CURRENT_SHA=$(git -C "$TARGET_DIR" rev-parse --verify HEAD 2>/dev/null || true)
+  if [[ -n "$REQUESTED_SHA" && "$REQUESTED_SHA" == "$CURRENT_SHA" ]]; then
+    echo ">> Using cached git repository in $TARGET_DIR (HEAD matches $GIT_SHA)"
+    exit 0
+  fi
+  echo ">> Cached $TARGET_DIR is at ${CURRENT_SHA:-unknown} but $GIT_SHA was requested; refreshing."
 fi
 
 echo ">> Fetching $GIT_SHA into $TARGET_DIR"

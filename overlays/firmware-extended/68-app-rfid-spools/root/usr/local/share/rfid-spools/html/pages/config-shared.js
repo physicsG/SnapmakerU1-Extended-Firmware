@@ -22,13 +22,23 @@ var ConfigShared = (function () {
             sel.appendChild(o);
         });
         return sel;
-    }    function checkSpoolmanStatus(url, badge) {
+    }    // Probe the Spoolman the printer is configured against. The deleted
+    // backend supported ad-hoc URL pings, but Moonraker only knows about
+    // the URL set in moonraker.conf — checking arbitrary URLs from the
+    // browser hits CORS. The Save action below already restarts Moonraker's
+    // Spoolman client when the URL changes; this badge just reports the
+    // status of whatever URL is currently live.
+    function checkSpoolmanStatus(url, badge) {
+        // `url` is intentionally unused — Moonraker's status reflects the
+        // URL it actually has configured. Keeping the parameter for API
+        // compatibility with callers that still pass it.
+        void url;
         badge.textContent = '\u2026';
         badge.className = 'spoolman-status-badge spoolman-status-checking';
-        fetch('/spools/api/spoolman-ping?url=' + encodeURIComponent(url))
-            .then(function (resp) { return resp.json(); })
+        Spoolman.status()
             .then(function (data) {
-                if (data.reachable) {
+                var ok = !!(data && (data.spoolman_connected || data.ok));
+                if (ok) {
                     badge.textContent = 'Connected \u2713';
                     badge.className = 'spoolman-status-badge spoolman-status-ok';
                 } else {
@@ -42,61 +52,21 @@ var ConfigShared = (function () {
             });
     }
 
+    // Spoolman auto-discovery is no longer offered: it relied on a
+    // backend-side network sweep that has no client-side equivalent.
+    // Surface a helpful message instead so the button still hints at
+    // what the user should do.
     function findSpoolman(input, badge) {
-        badge.textContent = 'Searching\u2026';
-        badge.className = 'spoolman-status-badge spoolman-status-checking';
-        fetch('/spools/api/spoolman-discover')
-            .then(function (resp) { return resp.json(); })
-            .then(function (data) {
-                var candidates = data.candidates || [];
-                if (candidates.length === 0) {
-                    badge.textContent = 'Not found';
-                    badge.className = 'spoolman-status-badge spoolman-status-err';
-                    return;
-                }
-                if (candidates.length === 1) {
-                    input.value = candidates[0];
-                    checkSpoolmanStatus(candidates[0], badge);
-                } else {
-                    badge.textContent = '';
-                    badge.className = 'spoolman-status-badge';
-                    var wrap = input.parentElement;
-                    var existing = wrap.querySelector('.spoolman-candidates');
-                    if (existing) wrap.removeChild(existing);
-                    var list = Templates.clone('spoolman-candidate-list');
-                    candidates.forEach(function (c) {
-                        var btn = Templates.clone('spoolman-candidate-btn');
-                        btn.textContent = c;
-                        btn.addEventListener('click', function () {
-                            input.value = c;
-                            wrap.removeChild(list);
-                            checkSpoolmanStatus(c, badge);
-                        });
-                        list.appendChild(btn);
-                    });
-                    wrap.appendChild(list);
-                }
-            })
-            .catch(function () {
-                badge.textContent = 'Search failed';
-                badge.className = 'spoolman-status-badge spoolman-status-err';
-            });
+        void input;
+        badge.textContent = 'Auto-discover not available \u2014 paste the Spoolman URL';
+        badge.className = 'spoolman-status-badge spoolman-status-err';
     }
 
     function saveConfigPartial(payload, saveBtn, statusEl) {
         saveBtn.disabled = true;
         saveBtn.textContent = 'Saving\u2026';
-        fetch('/spools/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        })
-            .then(function (resp) {
-                if (!resp.ok) throw new Error('HTTP ' + resp.status);
-                return resp.json();
-            })
-            .then(function (saved) {
-                App.setConfig(saved);
+        App.saveConfig(payload)
+            .then(function () {
                 saveBtn.disabled = false;
                 saveBtn.textContent = 'Save';
                 if (statusEl) {
