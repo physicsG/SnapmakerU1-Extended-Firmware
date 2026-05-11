@@ -2,6 +2,7 @@
 
 PIDFILE="/var/run/openrfid.pid"
 EXTENDED2_CFG="/oem/printer_data/config/extended/extended2.cfg"
+API_OVERRIDE_CFG="/tmp/openrfid_api_overrides.cfg"
 
 start() {
     RFID=$(/usr/local/bin/extended-config.py get "$EXTENDED2_CFG" components rfid snapmaker 2>/dev/null)
@@ -31,6 +32,36 @@ start() {
         ADDITIONAL_CONFIG=""
     fi
 
+    # Pick up additional integration configs dropped in by other overlays
+    # (e.g. 68-app-rfid-spools provides openrfid_api.cfg). The base/vendor/
+    # generic/user files are excluded here because they are passed
+    # explicitly above so their merge order is deterministic.
+    EXTRA_CONFIGS=""
+    for f in /usr/local/share/openrfid/extended/openrfid_*.cfg; do
+        [ -f "$f" ] || continue
+        case "$f" in
+            */openrfid_u1_base.cfg|*/openrfid_u1_vendor.cfg|*/openrfid_u1_generic.cfg|*/openrfid_user.cfg)
+                continue
+                ;;
+        esac
+        EXTRA_CONFIGS="$EXTRA_CONFIGS $f"
+    done
+
+    # Generate runtime override for [openrfid_api] enable_write based on the
+    # extended2.cfg [components] rfid_write toggle. The override file is
+    # included LAST so its values win over the static openrfid_api.cfg
+    # shipped by the SPA overlay. Only emitted when the toggle is true so
+    # the safe default (writes disabled) stands when the key is absent.
+    rm -f "$API_OVERRIDE_CFG"
+    RFID_WRITE=$(/usr/local/bin/extended-config.py get "$EXTENDED2_CFG" components rfid_write false 2>/dev/null)
+    if [ "$RFID_WRITE" = "true" ]; then
+        cat >"$API_OVERRIDE_CFG" <<'EOF'
+[openrfid_api]
+enable_write = true
+EOF
+        EXTRA_CONFIGS="$EXTRA_CONFIGS $API_OVERRIDE_CFG"
+    fi
+
     printf "Starting OpenRFID: "
     start-stop-daemon -S -b -m \
         -p "$PIDFILE" \
@@ -38,7 +69,8 @@ start() {
         /tmp/openrfid.cfg \
         /usr/local/share/openrfid/extended/openrfid_u1_base.cfg \
         $DETECT_CONFIG \
-        $ADDITIONAL_CONFIG
+        $ADDITIONAL_CONFIG \
+        $EXTRA_CONFIGS
     echo "OK"
 }
 

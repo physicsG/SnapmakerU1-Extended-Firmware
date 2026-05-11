@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 
-GIT_URL=https://github.com/suchmememanyskill/OpenRFID.git
-GIT_SHA=778bd576e436a083aa9940bf2edb0fd7d182913a
+GIT_URL=https://github.com/physicsG/OpenRFID.git
+# Pinned to the fork that adds the openrfid_api Moonraker controller,
+# openrfid_agent_event_exporter, Fm175xx.write_ntag_pages, runtime
+# pending-write queue, and the upstream tigertag encoder/processor
+# changes. Bump back to suchmememanyskill/OpenRFID once the PR merges.
+GIT_SHA=227312c72564454b4106b257b5593e181dfa28c3
 
 if [[ -z "$CREATE_FIRMWARE" ]]; then
   echo "Error: This script should be run within the create_firmware.sh environment."
