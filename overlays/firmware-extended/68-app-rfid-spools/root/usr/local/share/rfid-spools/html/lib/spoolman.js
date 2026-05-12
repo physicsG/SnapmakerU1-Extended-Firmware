@@ -92,9 +92,6 @@ var Spoolman = (function () {
         updateFilament: function (id, payload) {
             return _proxy('PATCH', '/v1/filament/' + encodeURIComponent(id), payload);
         },
-        updateFilament: function (id, payload) {
-            return _proxy('PATCH', '/v1/filament/' + encodeURIComponent(id), payload);
-        },
 
         listVendors: function () { return _proxy('GET', '/v1/vendor'); },
         createVendor: function (payload) {

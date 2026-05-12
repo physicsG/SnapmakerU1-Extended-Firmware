@@ -1523,15 +1523,6 @@ var SpoolsPage = (function () {
                         return Spoolman.createFilament(createPayload)
                             .then(function (fil) { return fil.id; });
                     });
-           
-                        return null;
-                    })
-                    .then(function (foundId) {
-                        if (foundId) return foundId;
-                        var createPayload = Object.assign({ vendor_id: vendorId }, basePayload);
-                        return Spoolman.createFilament(createPayload)
-                            .then(function (fil) { return fil.id; });
-                    });
             });
         }
 
@@ -2126,6 +2117,31 @@ var SpoolsPage = (function () {
                     }
                 }
                 renderSpoolmanInfoBox(normalised);
+
+                // Moonraker's /server/spoolman/status doesn't report
+                // counts, so when we're connected fan out three list
+                // calls in parallel and use Array.length. The Spoolman
+                // proxy is the same one the rest of the page uses, so
+                // any auth/url drift surfaces here too.
+                if (ok) {
+                    Promise.all([
+                        Spoolman.listSpools().catch(function () { return null; }),
+                        Spoolman.listFilaments().catch(function () { return null; }),
+                        Spoolman.listVendors().catch(function () { return null; })
+                    ]).then(function (results) {
+                        var counts = {
+                            spools:    Array.isArray(results[0]) ? results[0].length : null,
+                            filaments: Array.isArray(results[1]) ? results[1].length : null,
+                            vendors:   Array.isArray(results[2]) ? results[2].length : null
+                        };
+                        renderSpoolmanInfoBox({
+                            configured: configured,
+                            ok: ok,
+                            url: data && data.url,
+                            counts: counts
+                        });
+                    });
+                }
             })
             .catch(function () { /* ignore */ });
     }
