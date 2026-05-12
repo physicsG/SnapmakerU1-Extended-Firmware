@@ -60,50 +60,100 @@ var Spoolman = (function () {
             });
         },
 
-        info: function () { return _proxy('GET', '/api/v1/info'); },
+        // NOTE: Moonraker's spoolman proxy expects paths *without* the
+        // `/api` prefix — it prepends `/api` itself before forwarding to
+        // Spoolman. So we send `/v1/spool` here, not `/api/v1/spool`.
+        // Sending `/api/v1/...` makes Moonraker reject the request with
+        // 400 "Invalid path, must start with the API version".
+        info: function () { return _proxy('GET', '/v1/info'); },
 
         listSpools: function (params) {
-            return _proxy('GET', '/api/v1/spool' + _qs(params));
+            return _proxy('GET', '/v1/spool' + _qs(params));
         },
         getSpool: function (id) {
-            return _proxy('GET', '/api/v1/spool/' + encodeURIComponent(id));
+            return _proxy('GET', '/v1/spool/' + encodeURIComponent(id));
         },
         upsertSpool: function (payload) {
-            return _proxy('POST', '/api/v1/spool', payload);
+            return _proxy('POST', '/v1/spool', payload);
         },
         updateSpool: function (id, payload) {
-            return _proxy('PATCH', '/api/v1/spool/' + encodeURIComponent(id), payload);
+            return _proxy('PATCH', '/v1/spool/' + encodeURIComponent(id), payload);
         },
 
         listFilaments: function (params) {
-            return _proxy('GET', '/api/v1/filament' + _qs(params));
+            return _proxy('GET', '/v1/filament' + _qs(params));
         },
         getFilament: function (id) {
-            return _proxy('GET', '/api/v1/filament/' + encodeURIComponent(id));
+            return _proxy('GET', '/v1/filament/' + encodeURIComponent(id));
         },
         createFilament: function (payload) {
-            return _proxy('POST', '/api/v1/filament', payload);
+            return _proxy('POST', '/v1/filament', payload);
+        },
+        updateFilament: function (id, payload) {
+            return _proxy('PATCH', '/v1/filament/' + encodeURIComponent(id), payload);
+        },
+        updateFilament: function (id, payload) {
+            return _proxy('PATCH', '/v1/filament/' + encodeURIComponent(id), payload);
         },
 
-        listVendors: function () { return _proxy('GET', '/api/v1/vendor'); },
+        listVendors: function () { return _proxy('GET', '/v1/vendor'); },
         createVendor: function (payload) {
-            return _proxy('POST', '/api/v1/vendor', payload);
+            return _proxy('POST', '/v1/vendor', payload);
         },
 
-        // Extra-fields management. Spoolman exposes `/api/v1/field/<entity>`
+        // Extra-fields management. Spoolman exposes `/v1/field/<entity>`
         // (entity in {spool, filament, vendor}) for listing & creating
         // user-defined fields. We pin to `spool` since that's where the SPA
         // stores its TigerTag-derived attributes.
         listExtraFields: function (entity) {
             entity = entity || 'spool';
-            return _proxy('GET', '/api/v1/field/' + encodeURIComponent(entity));
+            return _proxy('GET', '/v1/field/' + encodeURIComponent(entity));
         },
         createExtraField: function (entity, key, payload) {
             entity = entity || 'spool';
             return _proxy('POST',
-                '/api/v1/field/' + encodeURIComponent(entity)
+                '/v1/field/' + encodeURIComponent(entity)
                     + '/' + encodeURIComponent(key),
                 payload);
+        },
+
+        // Writes /oem/printer_data/config/extended/moonraker/05_spoolman.cfg
+        // via Moonraker's standard file API (root=config) and triggers a
+        // Moonraker self-restart so the [spoolman] section is picked up.
+        // Returns a Promise that resolves once the restart was *requested*
+        // (Moonraker disconnects mid-call; the caller should poll
+        // Spoolman.status() afterwards).
+        // Refs:
+        //   https://moonraker.readthedocs.io/en/latest/external_api/file_manager/#file-upload
+        //   https://moonraker.readthedocs.io/en/latest/external_api/server/#restart-server
+        writeServerConfig: function (url, syncRate) {
+            var rate = (syncRate === undefined || syncRate === null) ? 5 : syncRate;
+            var body = '[spoolman]\nserver: ' + url + '\nsync_rate: ' + rate + '\n';
+            var fd = new FormData();
+            fd.append('root', 'config');
+            fd.append('file', new Blob([body], { type: 'text/plain' }),
+                      'extended/moonraker/05_spoolman.cfg');
+            return fetch('/server/files/upload', { method: 'POST', body: fd })
+                .then(function (resp) {
+                    if (!resp.ok) {
+                        return resp.text().then(function (t) {
+                            throw new Error('upload failed: ' + resp.status
+                                + (t ? ' ' + t : ''));
+                        });
+                    }
+                    return fetch('/server/restart', { method: 'POST' });
+                })
+                .then(function (resp) {
+                    // 200 ok, but Moonraker also closes connections
+                    // immediately on restart — a network error here is
+                    // expected and benign.
+                    if (resp && !resp.ok) {
+                        return resp.text().then(function (t) {
+                            throw new Error('restart failed: ' + resp.status
+                                + (t ? ' ' + t : ''));
+                        });
+                    }
+                });
         }
     };
 })();

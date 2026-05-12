@@ -107,7 +107,10 @@
 </template>
 
 <template id="spoolman-sync-badge">
-    <a class="spoolman-sync-badge" target="_blank" rel="noopener noreferrer"></a>
+    <span class="spoolman-sync-badge-wrap">
+        <a class="spoolman-sync-badge" data-id="link" target="_blank" rel="noopener noreferrer"></a>
+        <button type="button" class="spoolman-unlink-btn" data-id="unlink" title="Unlink this slot from the Spoolman spool">Unlink</button>
+    </span>
 </template>
 
 <template id="spoolman-sync-body-loading">
@@ -123,6 +126,7 @@
 
 <template id="spoolman-sync-body-form">
     <div>
+        <div data-id="suggestions-slot"></div>
         <div class="spoolman-sync-field-row">
             <span class="spoolman-sync-label">Name</span>
             <input type="text" class="spoolman-name-input" data-id="name-input" placeholder="Filament name">
@@ -136,6 +140,24 @@
             <button class="spoolman-sync-btn" data-id="sync-btn" type="button"></button>
         </div>
         <div class="spoolman-sync-status" data-id="status"></div>
+    </div>
+</template>
+
+<template id="spoolman-suggestions">
+    <div class="spoolman-suggestions">
+        <div class="spoolman-suggestions-title">Suggestions</div>
+        <div class="spoolman-suggestions-list" data-id="list"></div>
+    </div>
+</template>
+
+<template id="spoolman-suggestion-row">
+    <div class="spoolman-suggestion-row">
+        <span class="spoolman-suggestion-swatch" data-id="swatch"></span>
+        <div class="spoolman-suggestion-text">
+            <div class="spoolman-suggestion-name" data-id="name"></div>
+            <div class="spoolman-suggestion-meta" data-id="meta"></div>
+        </div>
+        <button type="button" class="spoolman-suggestion-link" data-id="link-btn">Link</button>
     </div>
 </template>
 

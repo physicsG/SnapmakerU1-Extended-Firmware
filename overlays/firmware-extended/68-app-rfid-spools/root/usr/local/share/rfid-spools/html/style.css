@@ -629,6 +629,67 @@ header h1 {
 .spoolman-sync-ok  { color: #4caf50; }
 .spoolman-sync-err { color: #f44336; }
 
+/* ── Spoolman match suggestions (above the create form) ──────────────────── */
+.spoolman-suggestions {
+    margin: 0.25rem 0 0.5rem;
+    padding: 0.4rem 0.5rem;
+    border: 1px dashed rgba(255,255,255,0.15);
+    border-radius: 4px;
+    background: rgba(255,255,255,0.02);
+}
+.spoolman-suggestions-title {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-dim);
+    margin-bottom: 0.3rem;
+}
+.spoolman-suggestions-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+.spoolman-suggestion-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.78rem;
+}
+.spoolman-suggestion-swatch {
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    border: 1px solid rgba(255,255,255,0.25);
+    background: transparent;
+    flex-shrink: 0;
+}
+.spoolman-suggestion-text { flex: 1; min-width: 0; }
+.spoolman-suggestion-name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.spoolman-suggestion-meta {
+    color: var(--text-dim);
+    font-size: 0.7rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.spoolman-suggestion-link {
+    background: transparent;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.72rem;
+    padding: 0.15rem 0.55rem;
+    white-space: nowrap;
+}
+.spoolman-suggestion-link:hover    { background: var(--accent); color: #fff; }
+.spoolman-suggestion-link:disabled { opacity: 0.5; cursor: default; }
+
 /* ── Spoolman sync state badge + spinner (inside box header) ─────────────── */
 @keyframes spoolman-spin { to { transform: rotate(360deg); } }
 .spoolman-spinner {
@@ -677,6 +738,22 @@ header h1 {
     white-space: nowrap;
 }
 .spoolman-sync-badge:hover { background: rgba(76, 175, 80, 0.22); text-decoration: underline; }
+.spoolman-sync-badge-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+}
+.spoolman-unlink-btn {
+    background: transparent;
+    border: 1px solid rgba(244, 67, 54, 0.35);
+    border-radius: 3px;
+    color: #f44336;
+    cursor: pointer;
+    font-size: 0.65rem;
+    padding: 0.05rem 0.4rem;
+}
+.spoolman-unlink-btn:hover    { background: rgba(244, 67, 54, 0.15); }
+.spoolman-unlink-btn:disabled { opacity: 0.5; cursor: default; }
 
 /* ── Spoolman onboarding footer ──────────────────────────────────────────── */
 .channel-spoolman-onboard {

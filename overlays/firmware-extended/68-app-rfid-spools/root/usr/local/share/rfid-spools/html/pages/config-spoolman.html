@@ -2,14 +2,16 @@
   Templates for the Spoolman config page.
 
   Hooks (data-id):
-    page section:
+    config-spoolman-section (URL row):
       - url-input         : server URL <input>
       - status-badge      : connection status badge
       - find-btn          : "Find Spoolman" button
+    config-spoolman-extras-section (one per entity: filament/spool):
+      - title             : section heading text
       - extra-fields      : container for extra-field rows
       - register-btn      : "Register fields" button
       - register-status   : status badge next to register button
-    extra-field-row:
+    config-spoolman-extra-row:
       - checkbox          : sync-on/off checkbox
       - label             : human-readable label
       - key               : raw extra-field key (code)
@@ -30,8 +32,13 @@
                 <button class="config-btn-secondary" data-id="find-btn" type="button">Find Spoolman</button>
             </div>
         </div>
+    </div>
+</template>
+
+<template id="config-spoolman-extras-section">
+    <div class="config-section">
         <div class="config-slot-row">
-            <div class="config-extra-fields-title">Extra fields to sync (requires custom fields in Spoolman)</div>
+            <div class="config-extra-fields-title" data-id="title">Extra fields to sync</div>
             <div class="config-extra-fields-table" data-id="extra-fields"></div>
             <div class="config-spoolman-syncall-row">
                 <button class="config-btn-secondary" data-id="register-btn" type="button">Register fields in Spoolman</button>

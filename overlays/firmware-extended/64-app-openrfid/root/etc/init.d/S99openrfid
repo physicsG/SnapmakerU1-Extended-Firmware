@@ -3,6 +3,95 @@
 PIDFILE="/var/run/openrfid.pid"
 EXTENDED2_CFG="/oem/printer_data/config/extended/extended2.cfg"
 API_OVERRIDE_CFG="/tmp/openrfid_api_overrides.cfg"
+LEGACY_JSON="/oem/printer_data/config/extended/rfid-spools.json"
+SPOOLMAN_CFG="/oem/printer_data/config/extended/moonraker/05_spoolman.cfg"
+MOONRAKER_URL="http://127.0.0.1:7125"
+
+# One-shot migration of the legacy /oem/printer_data/config/extended/rfid-spools.json
+# (written by the pre-SPA backend) into:
+#   - Moonraker DB rfid_spools.settings   (slot_names, slot_notes, spoolman_extra_fields)
+#   - extended/moonraker/05_spoolman.cfg  (server URL, only if not already present)
+# Renames the legacy file to *.migrated when done so this only runs once.
+# All steps are best-effort; if Moonraker isn't up yet we just bail out and
+# the next boot will retry.
+migrate_legacy_json() {
+    [ -f "$LEGACY_JSON" ] || return 0
+    command -v /usr/local/bin/curl >/dev/null 2>&1 || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    # Wait briefly for moonraker to be reachable. 30s should be plenty
+    # since S61moonraker starts well before S99.
+    i=0
+    while [ $i -lt 30 ]; do
+        /usr/local/bin/curl -s -o /dev/null -m 1 "$MOONRAKER_URL/server/info" && break
+        i=$((i + 1))
+        sleep 1
+    done
+    if [ $i -ge 30 ]; then
+        echo "OpenRFID: moonraker not reachable, skipping rfid-spools.json migration"
+        return 0
+    fi
+
+    echo "OpenRFID: migrating legacy rfid-spools.json"
+
+    # Pull spoolman_url out first so we can seed 05_spoolman.cfg before
+    # posting the DB blob (the DB post is the slowest step).
+    SPOOLMAN_URL=$(python3 -c '
+import json, sys
+try:
+    with open("'"$LEGACY_JSON"'") as f:
+        d = json.load(f) or {}
+    print((d.get("spoolman_url") or "").strip())
+except Exception:
+    pass
+' 2>/dev/null)
+
+    if [ -n "$SPOOLMAN_URL" ] && [ ! -f "$SPOOLMAN_CFG" ]; then
+        mkdir -p "$(dirname "$SPOOLMAN_CFG")"
+        printf '[spoolman]\nserver: %s\nsync_rate: 5\n' "$SPOOLMAN_URL" > "$SPOOLMAN_CFG"
+        chown lava:lava "$SPOOLMAN_CFG" 2>/dev/null || true
+        chmod 0644 "$SPOOLMAN_CFG" 2>/dev/null || true
+        # Best-effort: ask Moonraker to reload so the [spoolman] section
+        # is picked up immediately instead of waiting for the next boot.
+        /usr/local/bin/curl -s -o /dev/null -X POST "$MOONRAKER_URL/server/restart" || true
+        # Give Moonraker a moment to come back before posting to the DB.
+        sleep 5
+        i=0
+        while [ $i -lt 20 ]; do
+            /usr/local/bin/curl -s -o /dev/null -m 1 "$MOONRAKER_URL/server/info" && break
+            i=$((i + 1))
+            sleep 1
+        done
+    fi
+
+    # Build the DB payload from the remaining legacy keys and POST it
+    # under namespace=rfid_spools key=settings (matches app.js).
+    DB_BODY=$(python3 -c '
+import json, sys
+try:
+    with open("'"$LEGACY_JSON"'") as f:
+        d = json.load(f) or {}
+except Exception:
+    sys.exit(1)
+value = {
+    "slot_names": d.get("slot_names") or {},
+    "slot_notes": d.get("slot_notes") or {},
+    "spoolman_url": (d.get("spoolman_url") or "").strip(),
+    "spoolman_extra_fields": d.get("spoolman_extra_fields") or {},
+}
+print(json.dumps({"namespace": "rfid_spools", "key": "settings", "value": value}))
+' 2>/dev/null)
+
+    if [ -n "$DB_BODY" ]; then
+        /usr/local/bin/curl -s -o /dev/null \
+            -X POST -H 'Content-Type: application/json' \
+            --data "$DB_BODY" \
+            "$MOONRAKER_URL/server/database/item" || true
+    fi
+
+    mv "$LEGACY_JSON" "${LEGACY_JSON}.migrated" 2>/dev/null || true
+    echo "OpenRFID: migration complete (legacy json renamed to .migrated)"
+}
 
 start() {
     RFID=$(/usr/local/bin/extended-config.py get "$EXTENDED2_CFG" components rfid snapmaker 2>/dev/null)
@@ -26,6 +115,8 @@ start() {
         echo "OpenRFID already running"
         return 0
     fi
+
+    migrate_legacy_json
 
     ADDITIONAL_CONFIG=/oem/printer_data/config/extended/openrfid_user.cfg
     if ! test -f "$ADDITIONAL_CONFIG"; then

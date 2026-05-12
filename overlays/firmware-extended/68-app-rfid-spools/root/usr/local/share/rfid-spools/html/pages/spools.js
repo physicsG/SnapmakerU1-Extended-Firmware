@@ -9,6 +9,11 @@ var SpoolsPage = (function () {
     var _unsubscribeStatus = null;     // notify_status_update unsubscribe handle
     var _spoolmanCache = {};           // channel → filament record
     var _spoolmanFetchPending = false; // prevents overlapping refresh batches
+    var _uidSyncIndex = {};            // uid (UPPERCASE) → {spool_id,filament_id,name,density}
+    var _spoolmanSpoolsCache = [];     // raw Spoolman spool list, refreshed alongside the index
+    var _uidSyncIndexTs = 0;           // last refresh epoch ms; 0 = never
+    var _uidSyncRefreshing = null;     // in-flight Promise (deduped)
+    var _UID_INDEX_TTL_MS = 30 * 1000;
     var _editingChannels = {};         // channel → true if user is editing inline
     var _writeEnabled = false;         // mirrors openrfid/list_channels.write_enabled
     var _filamentDetect = {};          // last printer.objects.query result for filament_detect
@@ -337,10 +342,15 @@ var SpoolsPage = (function () {
 
             if (isLinked && cacheValid) {
                 var syncBadge = Templates.clone('spoolman-sync-badge');
-                syncBadge.href = spoolmanUrl.replace(/\/$/, '') + '/filament/show/' + syncState.filament_id;
+                var badgeLink = Templates.$(syncBadge, '[data-id="link"]');
+                var unlinkBtn = Templates.$(syncBadge, '[data-id="unlink"]');
+                badgeLink.href = spoolmanUrl.replace(/\/$/, '') + '/filament/show/' + syncState.filament_id;
                 var badgeParts = ['Synced \u2713 \u00b7 Filament #' + syncState.filament_id];
                 if (syncState.spool_id) badgeParts.push('Spool #' + syncState.spool_id);
-                syncBadge.textContent = badgeParts.join(' \u00b7 ');
+                badgeLink.textContent = badgeParts.join(' \u00b7 ');
+                unlinkBtn.addEventListener('click', function () {
+                    unlinkChannel(channelIndex, syncState.spool_id, unlinkBtn);
+                });
                 badgeSlot.replaceWith(syncBadge);
             }
 
@@ -358,10 +368,15 @@ var SpoolsPage = (function () {
                 var syncBtn = Templates.$(form, '[data-id="sync-btn"]');
                 var syncStatus = Templates.$(form, '[data-id="status"]');
 
-                if (cacheValid && cached.name) {
-                    nameInput.value = cached.name;
-                } else if (f.message) {
+                // Pre-fill the name field. The tag's `Message` (TigerTag's
+                // free-text product label) wins over Spoolman's filament
+                // name so a freshly-written tag with a custom Message
+                // surfaces it on import; only fall back to the cached
+                // Spoolman name when the tag has no message at all.
+                if (f.message) {
                     nameInput.value = f.message;
+                } else if (cacheValid && cached.name) {
+                    nameInput.value = cached.name;
                 }
                 densityInput.value = (cacheValid && cached.density) ? cached.density : defaultDensity(f.type);
                 syncBtn.textContent = isLinked ? 'Sync \u2197' : 'Import to Spoolman \u2197';
@@ -370,6 +385,43 @@ var SpoolsPage = (function () {
                 syncBtn.addEventListener('click', function () {
                     syncToSpoolman(channelIndex, nameInput, densityInput, syncStatus, syncBtn, linkedFilamentId);
                 });
+
+                // Suggestion list: only when not linked yet. Filters out
+                // any spool already carrying *this* channel's UID so we
+                // don't suggest the spool the badge is already showing.
+                if (!isLinked) {
+                    var suggestionsSlot = Templates.$(form, '[data-id="suggestions-slot"]');
+                    if (suggestionsSlot) {
+                        var rawUid = (ch.tag && ch.tag.scan && ch.tag.scan.uid) || (ch.moonraker && ch.moonraker.CARD_UID);
+                        var uidStrSugg = Array.isArray(rawUid) ? formatUid(rawUid) : (rawUid ? String(rawUid) : null);
+                        var matches = findSpoolMatches(f, uidStrSugg ? [uidStrSugg] : []);
+                        if (matches.length) {
+                            var sugBox = Templates.clone('spoolman-suggestions');
+                            var sugList = Templates.$(sugBox, '[data-id="list"]');
+                            matches.forEach(function (m) {
+                                var row = Templates.clone('spoolman-suggestion-row');
+                                var fil = m.spool.filament || {};
+                                var vendor = (fil.vendor && fil.vendor.name) || '';
+                                var name = fil.name || ('Spool #' + m.spool.id);
+                                var swatch = Templates.$(row, '[data-id="swatch"]');
+                                if (fil.color_hex) swatch.style.background = '#' + fil.color_hex;
+                                Templates.$(row, '[data-id="name"]').textContent = name;
+                                var metaParts = [];
+                                if (vendor) metaParts.push(vendor);
+                                if (fil.material) metaParts.push(fil.material);
+                                metaParts.push('#' + m.spool.id);
+                                if (m.reasons.length) metaParts.push(m.reasons.join(', '));
+                                Templates.$(row, '[data-id="meta"]').textContent = metaParts.join(' \u00b7 ');
+                                var linkBtn = Templates.$(row, '[data-id="link-btn"]');
+                                linkBtn.addEventListener('click', function () {
+                                    linkExistingSpool(channelIndex, m.spool, syncStatus, linkBtn);
+                                });
+                                sugList.appendChild(row);
+                            });
+                            suggestionsSlot.appendChild(sugBox);
+                        }
+                    }
+                }
 
                 bodySlot.appendChild(form);
             }
@@ -1174,6 +1226,23 @@ var SpoolsPage = (function () {
                 if (ok) {
                     statusEl.textContent = '✓ Written';
                     statusEl.className = 'channel-edit-status channel-edit-ok';
+                    // Tag bytes just changed on disk — ask the agent to
+                    // re-read the slot so the cached `tag.filament` block
+                    // updates. Drop the spoolman cache + UID index for
+                    // this channel so the next render refreshes the
+                    // suggestion list and badge against the new tag
+                    // contents. The scan event re-fires fetchChannels
+                    // via onScan; we also schedule a manual fetch as a
+                    // belt-and-suspenders fallback in case the event is
+                    // dropped.
+                    delete _spoolmanCache[channel];
+                    _uidSyncIndexTs = 0;
+                    var openrfidRefresh = App.openrfid();
+                    openrfidRefresh.scanSlot(channel)
+                        .catch(function (err) {
+                            console.warn('post-write rescan failed:', err && err.message);
+                        });
+                    setTimeout(function () { fetchChannels(); }, 250);
                     setTimeout(function () { _closeEditModal(); }, 800);
                 } else {
                     var emsg = (res && (res.error || res.message)) || 'write failed';
@@ -1213,6 +1282,13 @@ var SpoolsPage = (function () {
                 if (ok) {
                     statusEl.textContent = '\u2713 Cleared';
                     statusEl.className = 'channel-edit-status channel-edit-ok';
+                    delete _spoolmanCache[channel];
+                    _uidSyncIndexTs = 0;
+                    App.openrfid().scanSlot(channel)
+                        .catch(function (err) {
+                            console.warn('post-clear rescan failed:', err && err.message);
+                        });
+                    setTimeout(function () { fetchChannels(); }, 250);
                     setTimeout(function () { _closeEditModal(); }, 800);
                 } else {
                     var emsg = (res && (res.error || res.message)) || 'clear failed';
@@ -1264,9 +1340,8 @@ var SpoolsPage = (function () {
 
         var prevLink = (App.getConfig().slot_spool_links || {})[uidStr];
 
-        // Build the Spoolman payload. We always create a new spool record
-        // when there's no prior link, otherwise patch the existing one so
-        // the link is stable across successive syncs.
+        // Compute the canonical RGB color hex (no leading #) for both the
+        // filament's first-class column and the on-tag derived display.
         var color = (function () {
             var src = f.colors;
             if (Array.isArray(src) && src.length > 0 && typeof src[0] === 'number') {
@@ -1280,17 +1355,226 @@ var SpoolsPage = (function () {
             return null;
         })();
 
-        var spoolPayload = {
-            initial_weight: (f.weight_grams && f.weight_grams > 0) ? f.weight_grams : 1000,
-            comment: nameInput.value.trim(),
-            extra: { rfid_uid: JSON.stringify(uidStr) }
-        };
-        if (filamentId) spoolPayload.filament_id = filamentId;
-        if (color) spoolPayload.extra.color_hex = JSON.stringify(color);
+        // Multi-tag-per-spool support: a single physical spool can carry
+        // up to two NTAG215 stickers. The canonical "tags belonging to
+        // this spool" lives on Spoolman (`spool.extra.rfid_uid` as a
+        // comma-separated string — Spoolman's `text` extra type only
+        // accepts JSON-encoded strings, not arrays). slot_spool_links
+        // is the local source of truth: every UID pointing at the same
+        // spool id belongs to the same set. Recompute on every write
+        // so a newly-linked second tag automatically appears in
+        // Spoolman too.
+        function computeUidString(spoolId) {
+            var links = App.getConfig().slot_spool_links || {};
+            var seen = {};
+            var arr = [];
+            if (spoolId) {
+                Object.keys(links).forEach(function (u) {
+                    if (links[u] === spoolId && !seen[u]) {
+                        seen[u] = true;
+                        arr.push(u);
+                    }
+                });
+            }
+            if (!seen[uidStr]) arr.push(uidStr);
+            return arr.join(',');
+        }
 
-        var op = prevLink
-            ? Spoolman.updateSpool(prevLink, spoolPayload)
-            : Spoolman.upsertSpool(spoolPayload);
+        // Spoolman 422s any POST/PATCH that touches an extra-field key it
+        // doesn't know about. `rfid_uid` is mandatory for our UID-based
+        // linking, so transparently make sure it's registered before the
+        // first upsert. Idempotent: list first, only create what's
+        // missing — mirrors the explicit "Register fields" button on the
+        // Spoolman config page. `color_hex` is a first-class filament
+        // column so we don't register it as a spool extra.
+        var ensureCoreSpoolExtras = Spoolman.listExtraFields('spool')
+            .then(function (existing) {
+                var have = {};
+                if (Array.isArray(existing)) {
+                    for (var k = 0; k < existing.length; k++) {
+                        if (existing[k] && existing[k].key) have[existing[k].key] = true;
+                    }
+                }
+                if (have.rfid_uid) return;
+                return Spoolman.createExtraField('spool', 'rfid_uid',
+                    { name: 'RFID Tag UID', field_type: 'text' }
+                ).catch(function () {});
+            })
+            .catch(function () { /* best-effort; the upsert below will surface real errors */ });
+
+        // Locate (or create) a filament we can attach the spool to. Three
+        // cases: explicit filamentId from the picker, existing link
+        // (look up via prevLink so we PATCH the same filament), and
+        // no prior state (full vendor → filament create chain).
+        function resolveFilament() {
+            if (filamentId) return Promise.resolve(filamentId);
+            if (prevLink) {
+                return Spoolman.getSpool(prevLink).then(function (spool) {
+                    if (spool && spool.filament && spool.filament.id) {
+                        return spool.filament.id;
+                    }
+                    // Existing spool with no filament shouldn't happen,
+                    // but fall through to the create chain rather than
+                    // hard-failing the sync.
+                    return createVendorAndFilament();
+                });
+            }
+            return createVendorAndFilament();
+        }
+
+        // Build the Spoolman filament payload from the current tag
+        // fields + form inputs. Used both when creating a brand-new
+        // filament and when PATCHing an existing one on resync, so the
+        // "Sync ↗" button actually pushes the latest tag data instead of
+        // just touching the spool.
+        function buildFilamentPayload() {
+            var vendorName = (f.manufacturer && String(f.manufacturer).trim())
+                              || 'Generic';
+            var filName = (nameInput.value && nameInput.value.trim())
+                || (vendorName + ' '
+                    + (f.type || 'Filament')
+                    + (Array.isArray(f.modifiers) && f.modifiers.length
+                        ? ' ' + f.modifiers.join(' ')
+                        : ''));
+            var payload = {
+                name: filName,
+                density: density,
+                diameter: f.diameter_mm || 1.75
+            };
+            if (f.type) payload.material = f.type;
+            if (color) payload.color_hex = color;
+            if (f.weight_grams && f.weight_grams > 0) payload.weight = f.weight_grams;
+            if (typeof f.hotend_max_temp_c === 'number') {
+                payload.settings_extruder_temp = f.hotend_max_temp_c;
+            }
+            if (typeof f.bed_temp_c === 'number') {
+                payload.settings_bed_temp = f.bed_temp_c;
+            }
+
+            // Populate the seven registered filament extras from tag
+            // data so the filament stays useful. Spoolman stores extras
+            // as JSON-encoded values (the same `JSON.stringify`
+            // convention Mainsail and Fluidd use), so ints/floats/
+            // strings all round-trip.
+            var extra = {};
+            function setExtra(key, val) {
+                if (val === undefined || val === null || val === '') return;
+                extra[key] = JSON.stringify(val);
+            }
+            setExtra('max_extruder_temp', f.hotend_max_temp_c);
+            setExtra('max_bed_temp',      f.bed_temp_max_c);
+            setExtra('drying_temp',       f.drying_temp_c);
+            setExtra('drying_time',       f.drying_time_hours);
+            setExtra('td',                f.td);
+            setExtra('mfg_date',          f.manufacturing_date);
+            if (Array.isArray(f.modifiers) && f.modifiers.length) {
+                setExtra('modifiers', f.modifiers.join(', '));
+            } else if (typeof f.modifiers === 'string' && f.modifiers) {
+                setExtra('modifiers', f.modifiers);
+            }
+            if (Object.keys(extra).length) payload.extra = extra;
+            return payload;
+        }
+
+        function resolveVendorId() {
+            var vendorName = (f.manufacturer && String(f.manufacturer).trim())
+                              || 'Generic';
+            return Spoolman.listVendors()
+                .then(function (vendors) {
+                    if (Array.isArray(vendors)) {
+                        var lower = vendorName.toLowerCase();
+                        for (var v = 0; v < vendors.length; v++) {
+                            if (vendors[v] && vendors[v].name
+                                && String(vendors[v].name).toLowerCase() === lower) {
+                                return vendors[v].id;
+                            }
+                        }
+                    }
+                    return Spoolman.createVendor({ name: vendorName })
+                        .then(function (vend) { return vend.id; });
+                });
+        }
+
+        function createVendorAndFilament() {
+            return resolveVendorId().then(function (vendorId) {
+                var basePayload = buildFilamentPayload();
+                var filName = basePayload.name;
+                // Avoid duplicate filaments on retry: look for an
+                // existing filament with the same vendor + name and
+                // reuse it. Spoolman doesn't enforce uniqueness, so
+                // this is the SPA's responsibility.
+                return Spoolman.listFilaments({ vendor_id: vendorId })
+                    .catch(function () { return []; })
+                    .then(function (existing) {
+                        if (Array.isArray(existing)) {
+                            var lower = filName.toLowerCase();
+                            for (var i = 0; i < existing.length; i++) {
+                                if (existing[i] && existing[i].name
+                                    && String(existing[i].name).toLowerCase() === lower) {
+                                    return existing[i].id;
+                                }
+                            }
+                        }
+                        return null;
+                    })
+                    .then(function (foundId) {
+                        if (foundId) return foundId;
+                        var createPayload = Object.assign({ vendor_id: vendorId }, basePayload);
+                        return Spoolman.createFilament(createPayload)
+                            .then(function (fil) { return fil.id; });
+                    });
+           
+                        return null;
+                    })
+                    .then(function (foundId) {
+                        if (foundId) return foundId;
+                        var createPayload = Object.assign({ vendor_id: vendorId }, basePayload);
+                        return Spoolman.createFilament(createPayload)
+                            .then(function (fil) { return fil.id; });
+                    });
+            });
+        }
+
+        var op = ensureCoreSpoolExtras
+            .then(resolveFilament)
+            .then(function (resolvedFilamentId) {
+                // On resync of an existing link, push the latest tag
+                // fields (Name input, density, color, weight, temps,
+                // extras) onto the filament so the Sync button actually
+                // syncs — not just touches the spool. We don't reassign
+                // the vendor here: that would be too surprising if the
+                // user manually moved the filament under a different
+                // vendor in Spoolman. New imports go through
+                // createVendorAndFilament which already sets the vendor.
+                if (prevLink) {
+                    var filPayload = buildFilamentPayload();
+                    return Spoolman.updateFilament(resolvedFilamentId, filPayload)
+                        .catch(function (err) {
+                            console.warn('filament PATCH failed on resync:', err && err.message);
+                        })
+                        .then(function () { return resolvedFilamentId; });
+                }
+                return resolvedFilamentId;
+            })
+            .then(function (resolvedFilamentId) {
+                // Build the spool payload now that we have a filament_id
+                // committed. `rfid_uid` is recomputed from the live
+                // links so multi-tag spools stay in sync. The Name field
+                // in the form drives the *filament* name (see
+                // buildFilamentPayload), not the spool comment, so we
+                // leave `comment` unset and let Spoolman keep its
+                // default \u2014 overwriting it on every resync would clobber
+                // user notes added in the Spoolman UI.
+                var uidStrCsv = computeUidString(prevLink);
+                var spoolPayload = {
+                    filament_id: resolvedFilamentId,
+                    initial_weight: (f.weight_grams && f.weight_grams > 0) ? f.weight_grams : 1000,
+                    extra: { rfid_uid: JSON.stringify(uidStrCsv) }
+                };
+                return prevLink
+                    ? Spoolman.updateSpool(prevLink, spoolPayload)
+                    : Spoolman.upsertSpool(spoolPayload);
+            });
 
         op.then(function (spool) {
                 // Persist the UID → spool-id link so the next sync patches
@@ -1318,7 +1602,10 @@ var SpoolsPage = (function () {
                 statusEl.textContent = prevLink ? 'Updated \u2713' : 'Created \u2713';
                 statusEl.className = 'spoolman-sync-status spoolman-sync-ok';
                 delete _spoolmanCache[channel];
-                fetchChannels();
+                // Force the UID matcher to repull so the new/updated spool
+                // shows the synced badge immediately instead of after the
+                // 30s TTL.
+                refreshUidSyncIndex(true).then(function () { fetchChannels(); });
                 return spool;
             })
             .catch(function (err) {
@@ -1326,19 +1613,384 @@ var SpoolsPage = (function () {
                 btn.textContent = originalBtnText;
                 var msg = (err && err.message) || 'sync failed';
                 if (err && err.status === 422) {
-                    msg = 'Spoolman rejected the data \u2014 if you use extra fields, register them first in Config';
+                    msg = 'Spoolman rejected the data \u2014 check Config \u2192 Spoolman that filament extras are registered';
                 }
                 statusEl.textContent = msg;
                 statusEl.className = 'spoolman-sync-status spoolman-sync-err';
             });
     }
 
+    // Parse a Spoolman `extra.rfid_uid` value into an array of UID strings.
+    // Spoolman's `text` field type stores values as JSON-encoded strings, so
+    // the raw value looks like `"\"AABBCC,112233\""`. Tolerates three forms:
+    //   1. JSON-encoded CSV string  → "AABBCC,112233"   (current write format)
+    //   2. JSON-encoded single UID  → "AABBCC"          (legacy, pre-multi-tag)
+    //   3. JSON-encoded array       → ["AABBCC","..."]   (legacy, never written but Spoolman accepts)
+    function parseRfidUidExtra(raw) {
+        if (raw === undefined || raw === null) return [];
+        var val = raw;
+        if (typeof val === 'string') {
+            try { val = JSON.parse(val); } catch (e) { /* treat as plain string */ }
+        }
+        var out = [];
+        if (Array.isArray(val)) {
+            for (var i = 0; i < val.length; i++) {
+                if (val[i]) out.push(String(val[i]).trim());
+            }
+        } else if (typeof val === 'string') {
+            var parts = val.split(',');
+            for (var j = 0; j < parts.length; j++) {
+                var p = parts[j].trim();
+                if (p) out.push(p);
+            }
+        } else if (typeof val === 'number') {
+            out.push(String(val));
+        }
+        return out;
+    }
+
+    // Pull the full Spool list from Spoolman and rebuild the UID→spool index.
+    // This is the "matcher" that lets the SPA recognise spools whose tags
+    // were registered on Spoolman directly (or via a different printer)
+    // without ever having been imported through this UI. As a side effect
+    // it back-fills `slot_spool_links` so subsequent syncs PATCH instead of
+    // creating duplicate spools. Deduped via _uidSyncRefreshing.
+    function refreshUidSyncIndex(force) {
+        if (_uidSyncRefreshing) return _uidSyncRefreshing;
+        if (!force && (Date.now() - _uidSyncIndexTs) < _UID_INDEX_TTL_MS) {
+            return Promise.resolve(_uidSyncIndex);
+        }
+        _uidSyncRefreshing = Spoolman.listSpools()
+            .then(function (spools) {
+                _spoolmanSpoolsCache = Array.isArray(spools) ? spools : [];
+                var idx = {};
+                if (Array.isArray(spools)) {
+                    for (var i = 0; i < spools.length; i++) {
+                        var sp = spools[i];
+                        if (!sp || !sp.extra) continue;
+                        var uids = parseRfidUidExtra(sp.extra.rfid_uid);
+                        if (!uids.length) continue;
+                        var fil = sp.filament || {};
+                        var entry = {
+                            spool_id: sp.id,
+                            filament_id: fil.id || null,
+                            name: fil.name || ('Spool #' + sp.id),
+                            density: (typeof fil.density === 'number') ? fil.density : null
+                        };
+                        for (var u = 0; u < uids.length; u++) {
+                            idx[uids[u].toUpperCase()] = entry;
+                        }
+                    }
+                }
+                _uidSyncIndex = idx;
+                _uidSyncIndexTs = Date.now();
+
+                // Back-fill slot_spool_links for any UID Spoolman knows
+                // about but we don't. Single saveConfig at the end so we
+                // don't thrash the namespace API.
+                var localLinks = App.getConfig().slot_spool_links || {};
+                var merged = Object.assign({}, localLinks);
+                var changed = false;
+                Object.keys(idx).forEach(function (uidUpper) {
+                    var spoolId = idx[uidUpper].spool_id;
+                    if (merged[uidUpper] !== spoolId) {
+                        merged[uidUpper] = spoolId;
+                        changed = true;
+                    }
+                });
+                if (changed) {
+                    return App.saveConfig({ slot_spool_links: merged })
+                        .catch(function (err) { console.warn('back-fill slot_spool_links failed:', err && err.message); })
+                        .then(function () { return _uidSyncIndex; });
+                }
+                return _uidSyncIndex;
+            })
+            .catch(function (err) {
+                console.warn('refreshUidSyncIndex failed:', err && err.message);
+                // Don't clobber a stale-but-usable index on transient errors.
+                return _uidSyncIndex;
+            })
+            .then(function (idx) {
+                _uidSyncRefreshing = null;
+                return idx;
+            });
+        return _uidSyncRefreshing;
+    }
+
+    // Score Spoolman spools against the tag fields parsed off a channel
+    // and return the top candidates. Used to suggest "you probably want to
+    // link this slot to one of these existing spools" so the user doesn't
+    // create duplicates when they re-flash a printer or scan a known
+    // filament for the first time. Scoring is deliberately loose: any
+    // single signal (vendor, material, exact name, color within RGB
+    // distance) buys the spool a row, multiple signals push it up.
+    //
+    //   f             : resolveFields() output for the channel
+    //   excludeUids   : array of UIDs already linked to *this* channel
+    //                   (so we don't suggest the spool we already match)
+    //
+    // Returns up to 5 entries: { spool, score, reasons:[string] }.
+    function findSpoolMatches(f, excludeUids) {
+        if (!f || !_spoolmanSpoolsCache.length) return [];
+
+        function colorDistance(hexA, hexB) {
+            // Cheap RGB distance; lower = closer. ~30 looks "the same"
+            // on a 0-441 scale (worst case sqrt(3*255^2)).
+            if (!hexA || !hexB) return Infinity;
+            var a = hexA.replace(/^#/, '').toLowerCase();
+            var b = hexB.replace(/^#/, '').toLowerCase();
+            if (a.length !== 6 || b.length !== 6) return Infinity;
+            var ar = parseInt(a.slice(0, 2), 16), ag = parseInt(a.slice(2, 4), 16), ab = parseInt(a.slice(4, 6), 16);
+            var br = parseInt(b.slice(0, 2), 16), bg = parseInt(b.slice(2, 4), 16), bb = parseInt(b.slice(4, 6), 16);
+            var dr = ar - br, dg = ag - bg, db = ab - bb;
+            return Math.sqrt(dr * dr + dg * dg + db * db);
+        }
+
+        // Tag-side color → hex (no leading #), reusing the same logic
+        // syncToSpoolman uses for filament.color_hex.
+        var tagColor = (function () {
+            var src = f.colors;
+            if (Array.isArray(src) && src.length > 0 && typeof src[0] === 'number') {
+                var argb = src[0];
+                var r = (argb >> 16) & 0xFF, g = (argb >> 8) & 0xFF, b = argb & 0xFF;
+                return ('00' + r.toString(16)).slice(-2)
+                     + ('00' + g.toString(16)).slice(-2)
+                     + ('00' + b.toString(16)).slice(-2);
+            }
+            if (typeof src === 'string') return src.replace(/^#/, '');
+            return null;
+        })();
+
+        var tagVendor   = (f.manufacturer || '').toString().trim().toLowerCase();
+        var tagMaterial = (f.type || '').toString().trim().toLowerCase();
+        var tagName     = (f.message || '').toString().trim().toLowerCase();
+        var tagModifiers = Array.isArray(f.modifiers) ? f.modifiers.map(function (m) {
+            return String(m).toLowerCase();
+        }) : [];
+
+        var excludeUidSet = {};
+        (excludeUids || []).forEach(function (u) { excludeUidSet[String(u).toUpperCase()] = true; });
+
+        var out = [];
+        for (var i = 0; i < _spoolmanSpoolsCache.length; i++) {
+            var sp = _spoolmanSpoolsCache[i];
+            if (!sp) continue;
+            var fil = sp.filament || {};
+            var vendor = (fil.vendor && fil.vendor.name) || '';
+            var material = fil.material || '';
+            var name = fil.name || '';
+            var colorHex = fil.color_hex || '';
+
+            // Drop spools already linked to this channel (the badge handles those).
+            if (sp.extra && sp.extra.rfid_uid) {
+                var existing = parseRfidUidExtra(sp.extra.rfid_uid);
+                var alreadyLinkedHere = false;
+                for (var u = 0; u < existing.length; u++) {
+                    if (excludeUidSet[existing[u].toUpperCase()]) {
+                        alreadyLinkedHere = true; break;
+                    }
+                }
+                if (alreadyLinkedHere) continue;
+            }
+
+            var score = 0;
+            var reasons = [];
+
+            if (tagVendor && vendor && vendor.toLowerCase() === tagVendor) {
+                score += 3; reasons.push('vendor');
+            }
+            if (tagMaterial && material && material.toLowerCase() === tagMaterial) {
+                score += 2; reasons.push('material');
+            }
+            if (tagColor && colorHex) {
+                var dist = colorDistance(tagColor, colorHex);
+                if (dist <= 8)        { score += 3; reasons.push('color\u00a0\u2713'); }
+                else if (dist <= 30)  { score += 2; reasons.push('color\u2248'); }
+                else if (dist <= 60)  { score += 1; reasons.push('color~'); }
+            }
+            if (tagName && name) {
+                var nLower = name.toLowerCase();
+                if (nLower === tagName) { score += 3; reasons.push('name\u00a0\u2713'); }
+                else if (nLower.indexOf(tagName) !== -1 || tagName.indexOf(nLower) !== -1) {
+                    score += 1; reasons.push('name~');
+                }
+            }
+            if (tagModifiers.length && fil.extra && fil.extra.modifiers) {
+                var spMods = String(fil.extra.modifiers).toLowerCase();
+                for (var m = 0; m < tagModifiers.length; m++) {
+                    if (spMods.indexOf(tagModifiers[m]) !== -1) { score += 1; reasons.push('modifier'); break; }
+                }
+            }
+
+            if (score >= 2) out.push({ spool: sp, score: score, reasons: reasons });
+        }
+
+        out.sort(function (a, b) {
+            if (b.score !== a.score) return b.score - a.score;
+            return (a.spool.id || 0) - (b.spool.id || 0);
+        });
+        return out.slice(0, 5);
+    }
+
+    // Link an existing Spoolman spool to a channel UID:
+    //   1. PATCH the spool's extra.rfid_uid to add this UID (multi-tag aware).
+    //   2. saveConfig({slot_spool_links}) so the local map points at it.
+    //   3. Force-refresh the UID index + repaint so the badge appears.
+    function linkExistingSpool(channel, spool, statusEl, btn) {
+        var ch = null;
+        for (var i = 0; i < _channels.length; i++) {
+            if (_channels[i].channel === channel) { ch = _channels[i]; break; }
+        }
+        if (!ch) return;
+        var uid = (ch.tag && ch.tag.scan && ch.tag.scan.uid) || (ch.moonraker && ch.moonraker.CARD_UID);
+        var uidStr = Array.isArray(uid) ? formatUid(uid) : (uid ? String(uid) : null);
+        if (!uidStr) return;
+
+        var originalText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Linking\u2026';
+        if (statusEl) {
+            statusEl.textContent = '';
+            statusEl.className = 'spoolman-sync-status';
+        }
+
+        // Build the new UID list: existing extras + this UID, deduped.
+        var existing = (spool.extra && spool.extra.rfid_uid) ? parseRfidUidExtra(spool.extra.rfid_uid) : [];
+        var seen = {};
+        var uidArr = [];
+        existing.forEach(function (u) {
+            var k = u.toUpperCase();
+            if (!seen[k]) { seen[k] = true; uidArr.push(u); }
+        });
+        if (!seen[uidStr.toUpperCase()]) uidArr.push(uidStr);
+
+        Spoolman.updateSpool(spool.id, { extra: { rfid_uid: JSON.stringify(uidArr.join(',')) } })
+            .then(function () {
+                var links = Object.assign({}, App.getConfig().slot_spool_links || {});
+                links[uidStr] = spool.id;
+                return App.saveConfig({ slot_spool_links: links });
+            })
+            .then(function () {
+                btn.textContent = 'Linked \u2713';
+                if (statusEl) {
+                    statusEl.textContent = 'Linked to spool #' + spool.id;
+                    statusEl.className = 'spoolman-sync-status spoolman-sync-ok';
+                }
+                delete _spoolmanCache[channel];
+                refreshUidSyncIndex(true).then(function () { fetchChannels(); });
+            })
+            .catch(function (err) {
+                btn.disabled = false;
+                btn.textContent = originalText;
+                if (statusEl) {
+                    statusEl.textContent = (err && err.message) || 'link failed';
+                    statusEl.className = 'spoolman-sync-status spoolman-sync-err';
+                }
+            });
+    }
+
+    // Detach a channel from its current Spoolman spool: PATCH the spool's
+    // extra.rfid_uid to drop this channel's UID, drop the local
+    // slot_spool_links entry, and force-refresh so the badge clears and
+    // the create form / suggestions reappear. The spool itself stays in
+    // Spoolman; only the link is removed.
+    function unlinkChannel(channel, spoolId, btn) {
+        var ch = null;
+        for (var i = 0; i < _channels.length; i++) {
+            if (_channels[i].channel === channel) { ch = _channels[i]; break; }
+        }
+        if (!ch) return;
+        var uid = (ch.tag && ch.tag.scan && ch.tag.scan.uid) || (ch.moonraker && ch.moonraker.CARD_UID);
+        var uidStr = Array.isArray(uid) ? formatUid(uid) : (uid ? String(uid) : null);
+        if (!uidStr) return;
+
+        var originalText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Unlinking\u2026';
+
+        // Pull the spool fresh so we PATCH against the current value of
+        // extra.rfid_uid (other clients / the user may have edited it).
+        Spoolman.getSpool(spoolId)
+            .catch(function () { return null; })
+            .then(function (spool) {
+                var existing = (spool && spool.extra && spool.extra.rfid_uid)
+                    ? parseRfidUidExtra(spool.extra.rfid_uid)
+                    : [];
+                var uidUpper = uidStr.toUpperCase();
+                var remaining = existing.filter(function (u) {
+                    return String(u).toUpperCase() !== uidUpper;
+                });
+                // CSV form (matches the write path); empty string when no
+                // UIDs left so Spoolman keeps the field but clears it.
+                var patchBody = { extra: { rfid_uid: JSON.stringify(remaining.join(',')) } };
+                if (!spool) {
+                    // Spool already gone in Spoolman — skip the PATCH and
+                    // just clean up locally.
+                    return null;
+                }
+                return Spoolman.updateSpool(spoolId, patchBody);
+            })
+            .catch(function (err) {
+                // 404 or transient: still clean up the local link so the
+                // user isn't stuck staring at a broken badge.
+                console.warn('unlink PATCH failed:', err && err.message);
+            })
+            .then(function () {
+                var links = Object.assign({}, App.getConfig().slot_spool_links || {});
+                delete links[uidStr];
+                return App.saveConfig({ slot_spool_links: links });
+            })
+            .then(function () {
+                delete _spoolmanCache[channel];
+                _uidSyncIndexTs = 0;
+                refreshUidSyncIndex(true).then(function () { fetchChannels(); });
+            })
+            .catch(function (err) {
+                btn.disabled = false;
+                btn.textContent = originalText;
+                console.warn('unlink failed:', err && err.message);
+            });
+    }
+
+    // Annotate channels in-place with spoolman_sync info from the UID index.
+    // Mirrored into _spoolmanCache so the existing render path picks it up
+    // on first paint without an extra getSpool() round-trip per channel.
+    function applyUidSyncIndex(channels) {
+        for (var i = 0; i < channels.length; i++) {
+            var ch = channels[i];
+            var uid = (ch.tag && ch.tag.scan && ch.tag.scan.uid) || (ch.moonraker && ch.moonraker.CARD_UID);
+            var uidStr = Array.isArray(uid) ? formatUid(uid) : (uid ? String(uid) : null);
+            if (!uidStr) continue;
+            var entry = _uidSyncIndex[uidStr.toUpperCase()];
+            if (!entry) continue;
+            ch.spoolman_sync = { spool_id: entry.spool_id, filament_id: entry.filament_id };
+            _spoolmanCache[ch.channel] = {
+                spool_id: entry.spool_id,
+                filament_id: entry.filament_id,
+                name: entry.name,
+                density: entry.density
+            };
+        }
+    }
+
     function refreshSpoolmanCache(channels) {
+        // First refresh the UID→spool index (cheap when fresh); on completion,
+        // re-render via fetchChannels so the badge appears. The legacy
+        // per-channel getSpool path below is only used as a fallback when a
+        // UID is in slot_spool_links but the matching spool isn't in the
+        // index yet (e.g. just-created spool, index TTL not yet expired).
+        var spoolmanUrl = (App.getConfig() || {}).spoolman_url;
+        if (!spoolmanUrl) return;
+
+        var indexWasStale = (Date.now() - _uidSyncIndexTs) >= _UID_INDEX_TTL_MS;
+        refreshUidSyncIndex(false).then(function () {
+            if (indexWasStale) fetchChannels();
+        });
+
         if (_spoolmanFetchPending) return;
-        // Build the list of (channel, filament_id) pairs we still need to
-        // resolve. The backing data here is the on-tag UID → stored
-        // spool-id link; we resolve that into a Spoolman filament record so
-        // the card body can show the linked filament name/density.
+        // Build the list of (channel, spool_id) pairs we still need to
+        // resolve via getSpool — only those with a local link but no
+        // index entry (and not already cached).
         var links = (App.getConfig().slot_spool_links || {});
         var toFetch = [];
         for (var i = 0; i < channels.length; i++) {
@@ -1349,7 +2001,10 @@ var SpoolsPage = (function () {
             var spoolId = links[uidStr];
             if (!spoolId) continue;
             var cached = _spoolmanCache[ch.channel];
-            if (cached && cached.spool_id === spoolId) continue;
+            if (cached && cached.spool_id === spoolId && !cached.error) continue;
+            // Skip if the index already has this UID — applyUidSyncIndex
+            // covered it.
+            if (_uidSyncIndex[uidStr.toUpperCase()]) continue;
             toFetch.push({ channel: ch.channel, spoolId: spoolId });
         }
         if (toFetch.length === 0) return;
@@ -1377,6 +2032,24 @@ var SpoolsPage = (function () {
                     if (err && err.status === 404) {
                         delete _spoolmanCache[entry.channel];
                         needRerender = true;
+                        // Self-heal: the spool was deleted in Spoolman.
+                        // Drop the matching slot_spool_links entry so we
+                        // don't keep 404'ing on every refresh, and so the
+                        // user can re-import cleanly. Look up the UID by
+                        // walking the link map (cheaper than threading it
+                        // through this fetch).
+                        var links = (App.getConfig().slot_spool_links || {});
+                        var nextLinks = null;
+                        Object.keys(links).forEach(function (u) {
+                            if (links[u] === entry.spoolId) {
+                                if (!nextLinks) nextLinks = Object.assign({}, links);
+                                delete nextLinks[u];
+                            }
+                        });
+                        if (nextLinks) {
+                            App.saveConfig({ slot_spool_links: nextLinks })
+                                .catch(function () {});
+                        }
                     } else {
                         _spoolmanCache[entry.channel] = { error: true };
                         needRerender = true;
@@ -1541,6 +2214,7 @@ var SpoolsPage = (function () {
             var ocChannels = lc.channels || [];
             var fdInfo = fd.info || [];
             var merged = mergeChannels(ocChannels, fdInfo);
+            applyUidSyncIndex(merged);
             _channels = merged;
 
             var container = document.getElementById('channels');
