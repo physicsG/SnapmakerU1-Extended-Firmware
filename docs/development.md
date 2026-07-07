@@ -101,36 +101,44 @@ Open a shell in the development environment:
 ./dev.sh bash
 ```
 
-## Profiles
+## Addons
 
-The build system supports the `extended` profile with extensive modifications to the firmware.
+The `PROFILE` argument is parsed as `<firmware>[-<addon>]*`: a single required
+firmware name, followed by zero or more optional addon names, each joined
+with a `-`. The firmware name selects overlays from `overlays/firmware-<firmware>/`,
+and each addon name adds overlays from `overlays/addon-<addon>/`. Addons
+can be freely combined, e.g. `extended-devel`, `extended-qemu`, or
+`extended-devel-qemu`.
+
+Run `make addons` to list the firmwares and addons currently available.
 
 ## Overlays
 
-Overlays are organized into categories based on their scope and build profile. Each overlay is numbered to indicate its application order within its category.
+Overlays are organized into categories based on their scope and build addons. Each overlay is numbered to indicate its application order within its category.
 
 ### Overlay Categories
 
-- **common/** - Core modifications applied to all firmware profiles
-- **firmware-extended/** - Modifications specific to the extended firmware profile
-- **devel/** - Development tools and utilities (only included with DEVEL=1 flag)
-- **staging/** - Disabled overlays kept for potential future use
+- **common/** - Core modifications applied to all firmware builds
+- **firmware-\<name\>/** - Modifications specific to a firmware, e.g. `firmware-extended/`
+- **addon-\<name\>/** - Optional, composable overlays enabled by adding `-<name>` to `PROFILE`, e.g. `addon-devel/`
 
 ## Build Options
 
-- `extended-devel` - Add development overlays from `overlays/devel/`
-  - e.g. `./dev.sh make build PROFILE=extended DEVEL=1`
+- `extended-devel` - Add the `devel` addon overlays from `overlays/addon-devel/`
+  - e.g. `./dev.sh make build PROFILE=extended-devel`
+- `extended-qemu` - Add the `qemu` addon overlays from `overlays/addon-qemu/` (eth0 hotplug and virtio-touch hwdb mapping for the QEMU dev environment)
+  - e.g. `./dev.sh make build PROFILE=extended-qemu`
 
-### Devel Profile Features
+### Devel Addon Features
 
-When running firmware built with the `-devel` profile, additional development tools are available:
+When running firmware built with the `devel` addon, additional development tools are available:
 
 **Entware Package Manager**
 
 > The Entware is considered highly untrusted component,
 > and might be removed at any point in the future without notice.
 
-The devel profile includes Entware support for installing additional packages. After booting the devel firmware, initialize Entware:
+The devel addon includes Entware support for installing additional packages. After booting the devel firmware, initialize Entware:
 
 ```bash
 entware-ctrl init
@@ -149,9 +157,9 @@ Once initialized, use `opkg` to install packages from the Entware repository.
 ### Directory Structure
 
 ```text
-├── common/                          Core overlays applied to all profiles
-├── devel/                           Devel overlays applied to all profiles when `-devel`
-└── firmware-${profile}/             Profile-specific firmware overlays
+├── common/                          Core overlays applied to all builds
+├── firmware-${firmware}/            Firmware-specific overlays
+└── addon-${addon}/                  Optional overlays enabled by `-${addon}` in PROFILE
 ```
 
 ### Overlay Structure
@@ -168,7 +176,8 @@ Each overlay directory can contain:
 Overlays are applied in the following order:
 
 1. All overlays from `common/` (in numeric order)
-1. Profile-specific overlays from `firmware-${profile}/` (in numeric order)
+1. Firmware-specific overlays from `firmware-${firmware}/` (in numeric order)
+1. Addon-specific overlays from `addon-${addon}/` (in numeric order), for each `-${addon}` in `PROFILE`, in the order given
 
 ### Integrating Upstream Klipper Patches
 
@@ -204,10 +213,10 @@ The `20-klipper-patches` overlay in `firmware-extended/` backports upstream Klip
 ```text
 .
 ├── .github/                     Automated release builds
-├── overlays/                    Profile overlay directories
-│   ├── common/                  Core overlays for all profiles
-│   ├── devel/                   Devel overlays for all profiles
-│   └── firmware-${profile}/     Profile-specific firmware overlays
+├── overlays/                    Overlay directories
+│   ├── common/                  Core overlays for all builds
+│   ├── firmware-${firmware}/    Firmware-specific overlays
+│   └── addon-${addon}/          Optional overlays enabled by `-${addon}` in PROFILE
 ├── firmware/                    Downloaded and generated firmware files
 ├── scripts/                     Build and modification scripts
 ├── tmp/                         Temporary build artifacts
