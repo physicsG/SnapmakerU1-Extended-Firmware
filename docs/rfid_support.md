@@ -140,8 +140,9 @@ To enable it, navigate to the [firmware-config](firmware_config.md) web interfac
 | Snapmaker | Yes | - |
 | Elegoo | No | Elegoo spools tagged with RFID work unreliably |
 | [OpenSpool](https://openspool.io/) | Yes | - |
-| TigerTag | No | Fully offline implementation |
+| TigerTag | Yes | Fully offline implementation |
 | Qidi | Yes | - |
+| [SpoolEase](https://spoolease.io/) | No | NTAG NDEF tags; enable the processor to use |
 
 ### Bambu / Creality Spool Configuration
 
@@ -174,12 +175,17 @@ Some tag formats are disabled by default, for example as they do not read reliab
 /oem/printer_data/config/extended/openrfid_user.cfg
 ```
 
-Enable them by removing the `#` prefix from the tag processor. 
+Enable them by removing the `#` prefix from the tag processor.
 
 ```
 # [elegoo_tag_processor]
+```
 
-# [tigertag_tag_processor]
+[SpoolEase](https://spoolease.io/) tags (NTAG NDEF) are also supported but not
+enabled by default. Add the processor to the same file to use them:
+
+```ini
+[spoolease_tag_processor]
 ```
 
 ### Spools Web App (`/spools/`)

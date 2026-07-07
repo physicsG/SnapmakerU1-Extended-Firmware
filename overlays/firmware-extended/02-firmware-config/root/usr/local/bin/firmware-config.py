@@ -4,6 +4,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import subprocess
 import time
 import fcntl
@@ -22,7 +23,7 @@ def deep_merge(base, override):
 
 def load_functions_from_dir(functions_dir):
     """Load and deep merge all YAML files from a directory in sorted order."""
-    config = {'links': {}, 'settings': {}, 'actions': {}, 'status': {}, 'upgrade_url': {}, 'upgrade_upload': {}}
+    config = {'links': {}, 'settings': {}, 'actions': {}, 'quick_actions': {}, 'status': {}, 'upgrade_url': {}, 'upgrade_upload': {}}
 
     if not os.path.isdir(functions_dir):
         log(f"Functions directory not found: {functions_dir}")
@@ -57,7 +58,7 @@ def shell_to_cmd(shell, *args):
 
 class FirmwareConfigHandler(SimpleHTTPRequestHandler):
     html_dir = None
-    functions = {'settings': {}, 'links': {}, 'actions': {}, 'status': {}, 'upgrade_url': {}, 'upgrade_upload': {}}
+    functions = {'settings': {}, 'links': {}, 'actions': {}, 'quick_actions': {}, 'status': {}, 'upgrade_url': {}, 'upgrade_upload': {}}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=self.html_dir, **kwargs)
@@ -73,8 +74,10 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
             self.handle_get_settings()
         elif path == "/api/links":
             self.handle_get_links()
+        elif path == "/api/quick-actions":
+            self.handle_get_actions('quick_actions')
         elif path == "/api/actions":
-            self.handle_get_actions()
+            self.handle_get_actions('actions')
         else:
             super().do_GET()
 
@@ -122,13 +125,14 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
     def _finish_text_stream(self):
         pass
 
-    def _stream_command(self, cmd, stop_token=None):
+    def _stream_command(self, cmd, stop_token=None, env=None):
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1
+            bufsize=1,
+            env=env
         )
         try:
             for line in iter(process.stdout.readline, ""):
@@ -259,6 +263,7 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
 
                 result[section_key] = {
                     'title': section_cfg.get('title', section_key),
+                    'hidden': section_cfg.get('hidden', False),
                     'items': section_items
                 }
 
@@ -300,6 +305,10 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
                         opt_info = {"label": opt_val["label"]}
                         if "confirm" in opt_val:
                             opt_info["confirm"] = opt_val["confirm"]
+                        if opt_val.get("hidden"):
+                            opt_info["hidden"] = True
+                        if "inputs" in opt_val:
+                            opt_info["inputs"] = opt_val["inputs"]
                         options_data[opt_key] = opt_info
 
                     settings_list.append({
@@ -308,6 +317,7 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
                         "description": config.get("description"),
                         "help_url": config.get("help_url"),
                         "current": current_value,
+                        "hidden": config.get("hidden", False),
                         "options": options_data
                     })
                 if settings_list:
@@ -372,22 +382,26 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
             self.send_error(500, str(e))
 
     def _get_action_config(self, action_key):
-        actions = self.functions.get('actions', {})
-        for group_key, group_cfg in actions.items():
-            items = group_cfg.get('items', {})
-            if action_key in items:
-                return items[action_key]
+        for actions_cfg in (self.functions.get('quick_actions', {}), self.functions.get('actions', {})):
+            for group_key, group_cfg in actions_cfg.items():
+                items = group_cfg.get('items', {})
+                if action_key in items:
+                    return items[action_key]
         return None
 
-    def handle_get_actions(self):
+    def handle_get_actions(self, key):
         try:
-            actions_cfg = self.functions.get('actions', {})
+            actions_cfg = self.functions.get(key, {})
             result = {}
             for group_key, group_cfg in actions_cfg.items():
                 group_label = group_cfg.get('label', group_key)
                 items = group_cfg.get('items', {})
                 actions_list = []
                 for action_id, cfg in items.items():
+                    if_cmd = cfg.get('if_cmd')
+                    if if_cmd and not self._check_condition(if_cmd):
+                        continue
+
                     actions_list.append({
                         "id": action_id,
                         "label": cfg.get("label", action_id),
@@ -395,7 +409,8 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
                         "help_url": cfg.get("help_url"),
                         "confirm": cfg.get("confirm", False),
                         "background": cfg.get("background", False),
-                        "download_file": cfg.get("download_file")
+                        "download_file": cfg.get("download_file"),
+                        "hidden": cfg.get("hidden", False)
                     })
                 if actions_list:
                     result[group_key] = {
@@ -405,7 +420,7 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
 
             self.send_json(result)
         except Exception as e:
-            log(f"Get actions error: {e}")
+            log(f"Get {key} error: {e}")
             self.send_error(500, str(e))
 
     def handle_update_setting(self, setting_key, value):
@@ -422,6 +437,33 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
 
             option_config = config["options"][value]
 
+            input_values = {}
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length > 0:
+                try:
+                    parsed = json.loads(self.rfile.read(content_length))
+                    if isinstance(parsed, dict):
+                        input_values = {k: str(v) for k, v in parsed.items()}
+                except Exception:
+                    pass
+
+            valid_inputs = {}
+            for inp in option_config.get("inputs", []):
+                name = inp.get("name")
+                if not name:
+                    continue
+                val = input_values.pop(name, "")
+                rx = inp.get("regex")
+                if not val or (rx and not re.match(rx, val)):
+                    self.send_error(400, f"Invalid or missing input: {name}")
+                    return
+                valid_inputs[name] = val
+            if input_values:
+                self.send_error(400, f"Unknown inputs: {', '.join(input_values)}")
+                return
+
+            cmd_env = {**os.environ, **valid_inputs}
+
             log(f"Updating setting {setting_key} to {value}")
 
             self._start_text_stream()
@@ -432,9 +474,8 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
             self._write_stream_chunk(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             self._write_stream_chunk(f"{'=' * 40}\n\n")
 
-            # Execute the command for this option
             self._write_stream_chunk(f"Applying changes...\n")
-            rc, _ = self._stream_command(option_config["cmd"])
+            rc, _ = self._stream_command(option_config["cmd"], env=cmd_env)
 
             self._write_stream_chunk(f"\n{'=' * 40}\n")
             if rc == 0:

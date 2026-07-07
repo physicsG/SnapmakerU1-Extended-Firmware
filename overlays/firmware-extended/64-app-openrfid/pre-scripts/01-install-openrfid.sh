@@ -6,6 +6,8 @@ GIT_URL=https://github.com/physicsG/OpenRFID.git
 # pending-write queue, and the upstream tigertag encoder/processor
 # changes. Bump back to suchmememanyskill/OpenRFID once the PR merges.
 GIT_SHA=981902d59099a903ad35813a2f122ed1060381e4
+# GIT_URL=https://github.com/suchmememanyskill/OpenRFID.git
+# GIT_SHA=ddd1609e9abe9cd37c4b8fa1a0e4307b976d5fd4
 
 if [[ -z "$CREATE_FIRMWARE" ]]; then
   echo "Error: This script should be run within the create_firmware.sh environment."

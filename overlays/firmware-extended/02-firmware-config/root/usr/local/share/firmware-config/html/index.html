@@ -42,7 +42,7 @@
         .row-help:hover { text-decoration: none; opacity: 0.8; }
         .row select { align-self: flex-start; background: var(--card); border: 1px solid #555; border-radius: 6px; padding: 8px 12px; color: var(--text); font-size: 13px; cursor: pointer; min-width: 150px; max-width: 150px; }
         .row select:focus { outline: none; border-color: var(--accent); }
-        .links-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+        .links-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
         .link-item { background: var(--item); padding: 12px 16px; border-radius: 6px; text-decoration: none; display: flex; align-items: center; gap: 10px; transition: background 0.2s; }
         .link-item:hover { background: var(--hover); }
         .link-icon { font-size: 20px; }
@@ -98,10 +98,19 @@
             Authentication required. Please <a href="/">log in to Fluidd</a> first, then return to this page.
         </div>
 
+        <div id="hidden-notice" class="notice" style="background:var(--accent);color:#000">
+            Hidden options are visible.
+        </div>
+
         <div id="main-content">
         <div class="card">
             <div class="card-header"><span class="card-title">Status</span></div>
             <div id="status-container" class="info-grid"><div class="loading"><span class="spinner"></span> Loading...</div></div>
+        </div>
+
+        <div class="card" id="quick-actions-card" style="display:none">
+            <div class="card-header"><span class="card-title">Quick Actions</span></div>
+            <div id="quick-actions-container"><div class="loading"><span class="spinner"></span> Loading...</div></div>
         </div>
 
         <div class="card">
@@ -139,7 +148,9 @@
     <div class="modal-overlay" id="confirm-modal">
         <div class="modal">
             <div class="modal-title" id="confirm-title"></div>
+            <div id="confirm-help-link" style="display:none;margin-top:-10px;margin-bottom:16px;font-size:13px;"></div>
             <div class="modal-message" id="confirm-message" style="white-space:pre-wrap"></div>
+            <div id="confirm-input-wrap" style="display:none;"></div>
             <div class="modal-buttons">
                 <button class="btn btn-secondary" onclick="hideConfirmModal()">Cancel</button>
                 <button class="btn btn-danger" id="confirm-btn">Confirm</button>
@@ -190,6 +201,7 @@
         let selectedFile = null;
         let actionsData = [];
         let currentAction = '';
+        const showHidden = new URLSearchParams(window.location.search).has('hidden') || window.location.hash.includes('hidden');
 
         function showServiceNotice() {
             $('service-notice').classList.add('visible');
@@ -237,7 +249,9 @@
             try {
                 const status = await (await apiFetch('api/status')).json();
 
-                container.innerHTML = Object.entries(status).map(([key, section]) => {
+                container.innerHTML = Object.entries(status)
+                    .filter(([_, section]) => !section.hidden || showHidden)
+                    .map(([key, section]) => {
                     const itemsHtml = section.items.map(item =>
                         `<div><strong>${item.label}:</strong> ${item.value || 'N/A'}</div>`
                     ).join('');
@@ -267,16 +281,26 @@
             }
         }
 
-        async function loadActions() {
-            const container = $('actions-container');
+        async function loadActions(containerId, apiPath, cardId) {
+            const container = $(containerId);
+            const card = cardId ? $(cardId) : null;
             try {
-                const grouped = await (await apiFetch('api/actions')).json();
-                actionsData = Object.values(grouped).flatMap(g => g.items);
+                const grouped = await (await apiFetch(apiPath)).json();
 
-                container.innerHTML = Object.entries(grouped).map(([_, group]) =>
+                if (card) {
+                    if (Object.keys(grouped).length === 0) {
+                        card.style.display = 'none';
+                        return;
+                    }
+                    card.style.display = 'block';
+                }
+
+                const groupActions = Object.values(grouped).flatMap(g => g.items);
+                actionsData.push(...groupActions);
+                container.innerHTML = Object.values(grouped).map(group =>
                     `<div class="group-section">
                         <div class="group-title">${group.label}</div>
-                        ${group.items.map(action =>
+                        ${group.items.filter(action => !action.hidden || showHidden).map(action =>
                             `<div class="row" onclick="runAction('${action.id}')">
                                 <div class="row-label-wrap">
                                     <span class="row-label">${action.label}${action.help_url ? `<a class="row-help" href="${action.help_url}" target="_blank" onclick="event.stopPropagation()">↗</a>` : ''}</span>
@@ -288,6 +312,7 @@
                     </div>`
                 ).join('');
             } catch (e) {
+                if (card) card.style.display = 'block';
                 container.innerHTML = `<div class="loading" style="color:var(--error)">Error: ${e.message}</div>`;
             }
         }
@@ -308,16 +333,18 @@
                 container.innerHTML = groups.map(([_, group]) =>
                     `<div class="group-section">
                         <div class="group-title">${group.label}</div>
-                        ${group.items.map(setting => {
-                            const options = Object.entries(setting.options).map(([optKey, optVal]) => {
-                                return `<option value="${optKey}" data-label="${encodeURIComponent(optVal.label)}" data-confirm="${encodeURIComponent(optVal.confirm || '')}"${optKey === setting.current ? ' selected' : ''}>${optVal.label}</option>`;
+                        ${group.items.filter(setting => !setting.hidden || showHidden).map(setting => {
+                            const options = Object.entries(setting.options)
+                                .filter(([optKey, optVal]) => !optVal.hidden || optKey === setting.current || showHidden)
+                                .map(([optKey, optVal]) => {
+                                return `<option value="${optKey}" data-label="${encodeURIComponent(optVal.label)}" data-confirm="${encodeURIComponent(optVal.confirm || '')}" data-inputs="${encodeURIComponent(JSON.stringify(optVal.inputs || null))}"${optKey === setting.current ? ' selected' : ''}>${optVal.label}</option>`;
                             }).join('');
                             return `<div class="row"${setting.help_url ? ` onclick="if(!event.target.closest('select'))window.open('${setting.help_url}','_blank')"` : ''}>
                                 <div class="row-label-wrap">
                                     <span class="row-label">${setting.label}${setting.help_url ? `<a class="row-help" href="${setting.help_url}" target="_blank" onclick="event.stopPropagation()">↗</a>` : ''}</span>
                                     ${setting.description ? `<span class="row-desc">${setting.description}</span>` : ''}
                                 </div>
-                                <select data-prev-value="${setting.current}" onchange="updateSetting('${setting.id}', this)">${options}</select>
+                                <select data-prev-value="${setting.current}" data-help-url="${setting.help_url || ''}" onchange="updateSetting('${setting.id}', this)">${options}</select>
                             </div>`;
                         }).join('')}
                     </div>`
@@ -380,12 +407,77 @@
 
         let confirmOnCancel = null;
 
-        function showConfirmModal(title, message, onConfirm, onCancel) {
+        function renderConfirmInputs(inputs) {
+            const wrap = $('confirm-input-wrap');
+            if (!inputs || !inputs.length) {
+                wrap.style.display = 'none';
+                wrap.innerHTML = '';
+                return;
+            }
+            wrap.innerHTML = inputs.map(inp =>
+                `<div style="margin-top:12px;">
+                    <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px;">${inp.label || inp.name}</label>
+                    <input type="text" class="input" style="width:100%" id="cfi-${inp.name}" name="${inp.name}"
+                        placeholder="${inp.placeholder || ''}"
+                        data-regex="${inp.regex || ''}"
+                        oninput="validateConfirmInputs()">
+                    <div id="cfe-${inp.name}" style="font-size:11px;color:var(--error);margin-top:3px;min-height:14px;"></div>
+                </div>`
+            ).join('');
+            wrap.style.display = 'block';
+        }
+
+        function validateConfirmInputs() {
+            const wrap = $('confirm-input-wrap');
+            if (!wrap || wrap.style.display === 'none') { $('confirm-btn').disabled = false; return; }
+            let valid = true;
+            wrap.querySelectorAll('input[name]').forEach(field => {
+                const errEl = $('cfe-' + field.name);
+                const val = field.value.trim();
+                const rx = field.dataset.regex;
+                if (!val) {
+                    valid = false;
+                    if (errEl) errEl.textContent = '';
+                } else if (rx && !new RegExp(rx).test(val)) {
+                    valid = false;
+                    if (errEl) errEl.textContent = 'Invalid format';
+                } else {
+                    if (errEl) errEl.textContent = '';
+                }
+            });
+            $('confirm-btn').disabled = !valid;
+        }
+
+        function getConfirmInputValues() {
+            const wrap = $('confirm-input-wrap');
+            const values = {};
+            if (wrap && wrap.style.display !== 'none') {
+                wrap.querySelectorAll('input[name]').forEach(f => { values[f.name] = f.value.trim(); });
+            }
+            return values;
+        }
+
+        function showConfirmModal(title, message, onConfirm, onCancel, inputs, helpUrl) {
             $('confirm-title').textContent = title;
             $('confirm-message').textContent = message;
-            $('confirm-btn').onclick = () => { hideConfirmModal(); onConfirm(); };
+            const helpLinkEl = $('confirm-help-link');
+            if (helpUrl) {
+                helpLinkEl.innerHTML = `<a href="${helpUrl}" target="_blank">View documentation</a>`;
+                helpLinkEl.style.display = 'block';
+            } else {
+                helpLinkEl.style.display = 'none';
+            }
+            renderConfirmInputs(inputs);
+            validateConfirmInputs();
+            $('confirm-btn').onclick = () => {
+                const inputValues = getConfirmInputValues();
+                hideConfirmModal();
+                onConfirm(inputValues);
+            };
             confirmOnCancel = onCancel || null;
             $('confirm-modal').classList.add('visible');
+            const first = $('confirm-input-wrap').querySelector('input');
+            if (first) first.focus();
         }
 
         function hideConfirmModal() {
@@ -594,6 +686,7 @@
             try {
                 const resp = await apiFetch(`api/action/${id}`, { method: 'POST' });
                 await streamResponse(resp, id);
+                refreshAll();
             } catch (e) {
                 appendLog(`\nERROR: ${e.message}`);
                 setMessage('Failed', 'var(--error)');
@@ -649,7 +742,10 @@
             const selectedOption = selectEl.selectedOptions[0];
             const optLabel = decodeURIComponent(selectedOption.dataset.label || value);
             const confirmMsg = decodeURIComponent(selectedOption.dataset.confirm || '');
-            const label = selectEl.parentElement.querySelector('.row-label').textContent;
+            const inputs = JSON.parse(decodeURIComponent(selectedOption.dataset.inputs || 'null'));
+            const labelEl = selectEl.parentElement.querySelector('.row-label');
+            const label = Array.from(labelEl.childNodes).filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent).join('').trim();
+            const helpUrl = selectEl.dataset.helpUrl || '';
 
             const message = confirmMsg || `Change ${label} to "${optLabel}"?`;
             const warning = '⚠️ Warning: Changing settings will restart services and may interrupt printing.';
@@ -657,17 +753,24 @@
             showConfirmModal(
                 `Update ${label}`,
                 `${message}\n\n${warning}`,
-                () => { selectEl.dataset.prevValue = value; doUpdateSetting(key, value); },
-                () => { selectEl.value = prevValue; }
+                (inputValues) => { selectEl.dataset.prevValue = value; doUpdateSetting(key, value, inputValues); },
+                () => { selectEl.value = prevValue; },
+                inputs,
+                helpUrl
             );
         }
 
-        async function doUpdateSetting(key, value) {
+        async function doUpdateSetting(key, value, inputValues) {
             showActionModal('Updating Setting', 'Applying changes...');
             $('action-log').classList.add('visible');
 
             try {
-                const resp = await apiFetch(`api/settings/${key}/${value}`, { method: 'POST' });
+                const opts = { method: 'POST' };
+                if (inputValues && Object.keys(inputValues).length > 0) {
+                    opts.headers = { 'Content-Type': 'application/json' };
+                    opts.body = JSON.stringify(inputValues);
+                }
+                const resp = await apiFetch(`api/settings/${key}/${value}`, opts);
                 await streamResponse(resp);
                 refreshAll();
             } catch (e) {
@@ -714,8 +817,15 @@
             const btn = document.querySelector('h1 .btn');
             btn.innerHTML = '<span class="spinner"></span> Refresh';
             btn.disabled = true;
+            actionsData = [];
             try {
-                await Promise.all([loadStatus(), loadLinks(), loadSettings(), loadActions()]);
+                await Promise.all([
+                    loadStatus(),
+                    loadLinks(),
+                    loadSettings(),
+                    loadActions('quick-actions-container', 'api/quick-actions', 'quick-actions-card'),
+                    loadActions('actions-container', 'api/actions')
+                ]);
             } finally {
                 btn.innerHTML = '&#x21bb; Refresh';
                 btn.disabled = false;
@@ -726,6 +836,7 @@
         // Initialize
         // ========================================
 
+        if (showHidden) $('hidden-notice').classList.add('visible');
         refreshAll();
     </script>
 </body>

@@ -23,11 +23,16 @@ Writable fields:
 | `MAIN_TYPE` | `string` | `PLA`, `PETG`, `ABS`, `TPU`, `PVA` | Other values accepted but not RFID-protocol-mapped |
 | `SUB_TYPE` | `string` | `Basic`, `Matte`, `SnapSpeed`, `Silk`, `Support`, `HF`, `95A`, `95A HF` | Other values accepted but not RFID-protocol-mapped |
 | `RGB_1` | `int` | Integer RGB value | |
+| `RGB_2` | `int` | Integer RGB value | Requires `COLOR_NUMS` >= 2 on read |
+| `RGB_3` | `int` | Integer RGB value | Requires `COLOR_NUMS` >= 3 on read |
+| `RGB_4` | `int` | Integer RGB value | Requires `COLOR_NUMS` >= 4 on read |
+| `RGB_5` | `int` | Integer RGB value | Requires `COLOR_NUMS` >= 5 on read |
 | `ALPHA` | `int` | Integer 0..255 | |
 | `HOTEND_MIN_TEMP` | `int` | Integer | |
 | `HOTEND_MAX_TEMP` | `int` | Integer | |
 | `BED_TEMP` | `int` | Integer | |
-| `CARD_UID` | `list[int]` | Array of byte ints | |
+| `CARD_UID` | `list[int]` | Array of byte ints | Indicates a tag is physically present; independent of filament data |
+| `CARD_TYPE` | `string` | `NTAG`, `M1` | Tag hardware type; independent of filament data |
 | `SKU` | `int` | Integer | |
 
 Read-only fields (returned by query, not accepted by `set`):
@@ -35,12 +40,11 @@ Read-only fields (returned by query, not accepted by `set`):
 | Field | Notes |
 |---|---|
 | `ARGB_COLOR` | Derived: `(ALPHA << 24) \| RGB_1` |
-| `OFFICIAL` | `true` when `info` is non-empty (set by firmware) |
+| `OFFICIAL` | `true` when `info` contains at least one filament field other than `CARD_UID` |
 | `MANUFACTURER` | |
 | `VERSION` | |
 | `TRAY` | |
-| `COLOR_NUMS` | |
-| `RGB_2..RGB_5` | |
+| `COLOR_NUMS` | Derived: count of `RGB_x` fields provided (minimum 1) |
 | `DIAMETER` | |
 | `WEIGHT` | |
 | `LENGTH` | |
@@ -81,12 +85,33 @@ Request shape:
 | Field | Required | Type | Accepted values |
 |---|---|---|---|
 | `channel` | Yes | `int` | `0..3` |
-| `info` | No | `object` | If missing/empty, treated as clear/reset |
+| `info` | No | `object` | See set semantics below |
 
 Response:
 
 - Success: `{"state": "success"}`
 - Error: `{"state": "error", "message": "..."}`
+
+### Set semantics
+
+The endpoint has three modes determined by the filament fields present in `info`. `CARD_UID` is orthogonal — it can appear in any mode to record that a physical tag is present, even when the tag carries no filament data:
+
+| Mode | `info` content | `OFFICIAL` | Update path |
+|---|---|---|---|
+| Full update | One or more filament fields (± `CARD_UID`) | `true` | `_filament_info_update` called; `print_task_config` mirrored |
+| Tag present, no data | `CARD_UID` only | `false` | Direct assignment; if the slot was previously official, `_filament_info_update` is called to clear it |
+| Clear | Missing or empty | `false` | Direct assignment; filament fields reset to `FILAMENT_INFO_STRUCT` defaults |
+
+`CARD_UID` and `CARD_TYPE` are both popped before `has_params` is computed, so they never contribute to `OFFICIAL`. `CARD_TYPE` is populated automatically on hardware reads (`NTAG` via `filament_protocol_ndef`, `M1` via `filament_protocol`).
+
+## openrfid Integration
+
+`openrfid_u1_base.cfg` registers two webhook exporters that drive `filament_detect/set` automatically:
+
+| Exporter | Event | Payload | Effect |
+|---|---|---|---|
+| `parse_error_exporter` | `tag_parse_error` | `{"channel": N, "info": {"CARD_UID": [...]}}` | UID-only set; captures the hardware UID even when the tag payload cannot be decoded |
+| `not_present_exporter` | `tag_not_present` | `{"channel": N}` | Clear; resets the slot when no tag is present |
 
 ## OpenSpool U1 Extended Format Input
 
@@ -137,7 +162,7 @@ OpenSpool U1 Extended mapping profile:
 | `bed_min_temp`/`bed_max_temp` | `BED_TEMP` | `N/A` | collapsed to single bed temp |
 | `protocol` | `N/A` | `N/A` | parser validation only |
 | `version` | `N/A` | `N/A` | no endpoint field |
-| `additional_color_hexes` | `N/A` | `N/A` | no endpoint field; parser-only path supports extra colors |
+| `additional_color_hexes` | `RGB_2`..`RGB_N` | `N/A` | mapped to `RGB_2`..`RGB_5`; `COLOR_NUMS` derived from total color count |
 | `diameter` | `N/A` | `N/A` | no endpoint field |
 | `weight` | `N/A` | `N/A` | no endpoint field |
 
@@ -267,9 +292,10 @@ Transformation trace for this example:
 
 Repository overlays:
 
-- `overlays/firmware-extended/13-rfid-support/root/home/lava/klipper/klippy/extras/filament_protocol_ndef.py`
-- `overlays/firmware-extended/13-rfid-support/patches/02-add-ndef-protocol.patch`
-- `overlays/firmware-extended/13-rfid-support/patches/05-add-filament-detect-set-endpoint.patch`
+- `overlays/firmware-extended/13-patch-rfid/root/home/lava/klipper/klippy/extras/filament_protocol_ndef.py`
+- `overlays/firmware-extended/13-patch-rfid/patches/02-add-ndef-protocol.patch`
+- `overlays/firmware-extended/13-patch-rfid/patches/05-add-filament-detect-set-endpoint.patch`
+- `overlays/firmware-extended/64-app-openrfid/root/usr/local/share/openrfid/extended/openrfid_u1_base.cfg`
 
 Klipper source code:
 
