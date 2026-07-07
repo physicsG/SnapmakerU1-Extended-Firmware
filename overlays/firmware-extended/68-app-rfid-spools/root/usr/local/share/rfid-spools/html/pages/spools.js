@@ -1549,22 +1549,53 @@ var SpoolsPage = (function () {
             })
             .then(function (resolvedFilamentId) {
                 // Build the spool payload now that we have a filament_id
-                // committed. `rfid_uid` is recomputed from the live
-                // links so multi-tag spools stay in sync. The Name field
-                // in the form drives the *filament* name (see
-                // buildFilamentPayload), not the spool comment, so we
-                // leave `comment` unset and let Spoolman keep its
-                // default \u2014 overwriting it on every resync would clobber
-                // user notes added in the Spoolman UI.
-                var uidStrCsv = computeUidString(prevLink);
-                var spoolPayload = {
-                    filament_id: resolvedFilamentId,
-                    initial_weight: (f.weight_grams && f.weight_grams > 0) ? f.weight_grams : 1000,
-                    extra: { rfid_uid: JSON.stringify(uidStrCsv) }
-                };
-                return prevLink
-                    ? Spoolman.updateSpool(prevLink, spoolPayload)
-                    : Spoolman.upsertSpool(spoolPayload);
+                // committed. The Name field in the form drives the
+                // *filament* name (see buildFilamentPayload).
+                //
+                // For `rfid_uid` we union three sources to keep multi-tag
+                // spools robust across machines:
+                //   1. The remote `extra.rfid_uid` already on the spool
+                //      (so a UID written from another printer/tab isn't
+                //      silently dropped).
+                //   2. Our local `slot_spool_links` (every UID pointing
+                //      at this spool id).
+                //   3. The UID we're syncing right now.
+                function buildSpoolPayload(remoteUidStr) {
+                    var seen = {};
+                    var arr = [];
+                    function addAll(list) {
+                        if (!Array.isArray(list)) return;
+                        list.forEach(function (u) {
+                            if (!u) return;
+                            var k = String(u).toUpperCase();
+                            if (seen[k]) return;
+                            seen[k] = true;
+                            arr.push(String(u));
+                        });
+                    }
+                    addAll(parseRfidUidExtra(remoteUidStr));
+                    var localCsv = computeUidString(prevLink);
+                    addAll(localCsv ? localCsv.split(',') : []);
+                    addAll([uidStr]);
+                    return {
+                        filament_id: resolvedFilamentId,
+                        initial_weight: (f.weight_grams && f.weight_grams > 0) ? f.weight_grams : 1000,
+                        extra: { rfid_uid: JSON.stringify(arr.join(',')) }
+                    };
+                }
+
+                if (prevLink) {
+                    // Re-fetch the spool to merge with whatever extras
+                    // already exist remotely. Falls back to the local
+                    // union if the GET fails.
+                    return Spoolman.getSpool(prevLink)
+                        .catch(function () { return null; })
+                        .then(function (sp) {
+                            var remote = (sp && sp.extra && sp.extra.rfid_uid) || null;
+                            return Spoolman.updateSpool(prevLink, buildSpoolPayload(remote));
+                        });
+                }
+                return Spoolman.upsertSpool(buildSpoolPayload(null));
             });
 
         op.then(function (spool) {
@@ -2090,60 +2121,50 @@ var SpoolsPage = (function () {
     }
 
     function fetchSpoolmanStatus(forceRefreshInfoBox) {
-        Spoolman.status()
-            .then(function (data) {
-                var dot = document.getElementById('spoolman-status-dot');
-                var text = document.getElementById('spoolman-status-text');
-                // Moonraker returns {spoolman_connected: bool, ...}; map it
-                // onto the legacy {configured, ok, url, counts} shape the
-                // info-box renderer expects so the rest of the page stays
-                // the same.
-                var configured = !!(data && (data.spoolman_connected !== undefined || data.url));
-                var ok = !!(data && (data.spoolman_connected || data.ok));
-                var normalised = {
-                    configured: configured,
-                    ok: ok,
-                    url: data && data.url,
-                    counts: data && data.counts
-                };
-                if (dot && text) {
-                    if (!configured) {
-                        dot.style.display = 'none';
-                        text.style.display = 'none';
-                    } else {
-                        dot.style.display = '';
-                        text.style.display = '';
-                        dot.className = 'status-dot ' + (ok ? 'connected' : 'disconnected');
-                    }
-                }
-                renderSpoolmanInfoBox(normalised);
+        // Fan out status + the three list calls in parallel so the
+        // info box only renders ONCE with everything already filled in.
+        // Rendering on the status response and again on the count
+        // response caused a visible flicker (the second render ran
+        // through every cell, briefly showing "—" before settling).
+        var statusP = Spoolman.status().catch(function () { return null; });
+        var spoolsP = Spoolman.listSpools().catch(function () { return null; });
+        var filamentsP = Spoolman.listFilaments().catch(function () { return null; });
+        var vendorsP = Spoolman.listVendors().catch(function () { return null; });
 
-                // Moonraker's /server/spoolman/status doesn't report
-                // counts, so when we're connected fan out three list
-                // calls in parallel and use Array.length. The Spoolman
-                // proxy is the same one the rest of the page uses, so
-                // any auth/url drift surfaces here too.
-                if (ok) {
-                    Promise.all([
-                        Spoolman.listSpools().catch(function () { return null; }),
-                        Spoolman.listFilaments().catch(function () { return null; }),
-                        Spoolman.listVendors().catch(function () { return null; })
-                    ]).then(function (results) {
-                        var counts = {
-                            spools:    Array.isArray(results[0]) ? results[0].length : null,
-                            filaments: Array.isArray(results[1]) ? results[1].length : null,
-                            vendors:   Array.isArray(results[2]) ? results[2].length : null
-                        };
-                        renderSpoolmanInfoBox({
-                            configured: configured,
-                            ok: ok,
-                            url: data && data.url,
-                            counts: counts
-                        });
-                    });
+        Promise.all([statusP, spoolsP, filamentsP, vendorsP]).then(function (results) {
+            var data = results[0];
+            var spools = results[1];
+            var filaments = results[2];
+            var vendors = results[3];
+
+            var dot = document.getElementById('spoolman-status-dot');
+            var text = document.getElementById('spoolman-status-text');
+            var configured = !!(data && (data.spoolman_connected !== undefined || data.url));
+            var ok = !!(data && (data.spoolman_connected || data.ok));
+            if (dot && text) {
+                if (!configured) {
+                    dot.style.display = 'none';
+                    text.style.display = 'none';
+                } else {
+                    dot.style.display = '';
+                    text.style.display = '';
+                    dot.className = 'status-dot ' + (ok ? 'connected' : 'disconnected');
                 }
-            })
-            .catch(function () { /* ignore */ });
+            }
+
+            var counts = ok ? {
+                spools:    Array.isArray(spools)    ? spools.length    : null,
+                filaments: Array.isArray(filaments) ? filaments.length : null,
+                vendors:   Array.isArray(vendors)   ? vendors.length   : null
+            } : null;
+
+            renderSpoolmanInfoBox({
+                configured: configured,
+                ok: ok,
+                url: data && data.url,
+                counts: counts
+            });
+        });
     }
 
     // ── Spoolman info box ───────────────────────────────────────────────────
