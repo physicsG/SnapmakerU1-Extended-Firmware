@@ -182,6 +182,85 @@ Enable them by removing the `#` prefix from the tag processor.
 # [tigertag_tag_processor]
 ```
 
+### Spools Web App (`/spools/`)
+
+The extended firmware ships a small single-page app at `http://<printer>/spools/`
+that talks directly to Moonraker and the OpenRFID Moonraker agent over
+WebSocket — there is no per-app backend service.
+
+What it offers:
+
+- Live view of every channel's filament tag, color, temperatures and (when
+  available) the linked Spoolman spool.
+- "Spool picker" that searches your Spoolman library and links a spool to
+  the tag's UID — the link is stored in Moonraker's database under the
+  `rfid_spools` namespace, so it survives reboots and Moonraker restarts.
+- "Sync to Spoolman" round-trip that updates an existing spool, or creates
+  one in your default vendor and links it on the spot. Optional Spoolman
+  *extra fields* (drying temp, manufacturing date, modifiers, …) are
+  registered from the **Config → Spoolman** sub-page in one click.
+- "Edit / Write / Clear" buttons for NTAG215 tags. These are gated on the
+  **RFID Tag Writing** firmware-config toggle (see below) so that printers
+  without an authoring use-case never expose write affordances. The
+  TigerTag encoder used to author tags is served straight from the
+  on-printer database directory (`/usr/local/share/openrfid/tag/tigertag/database/`)
+  via an nginx alias under `/spools/static/openrfid/database/`.
+
+What changed compared to the original cgi-backed implementation:
+
+- Auto-discover Spoolman is no longer offered. Enter the URL on the
+  **Config → Spoolman** sub-page; Save writes
+  `/oem/printer_data/config/extended/moonraker/05_spoolman.cfg` (the file
+  is `[include]`-d into `moonraker.conf`) and triggers a Moonraker
+  self-restart so the change takes effect immediately. No firmware-config
+  toggle is required — the Spools page owns Spoolman wiring end to end.
+- All Spoolman traffic goes through Moonraker's `/server/spoolman/proxy`,
+  so the same authentication and CORS rules as the rest of Fluidd apply.
+
+### Configuring Spoolman
+
+1. Open `http://<printer>/spools/`.
+2. Go to **Config → Spoolman**.
+3. Paste the Spoolman base URL (e.g. `http://spoolman.local:7912`) and
+   click **Save**. The status badge will go to `…` while Moonraker
+   restarts (~5–10 s) and then back to `Connected ✓` once the
+   `[spoolman]` section is live.
+4. Optionally tick the **extra fields** you want synced and click
+   **Register fields in Spoolman** so the SPA can write things like
+   drying temperature and modifiers into your Spoolman library.
+
+If you previously stored the Spoolman URL in the legacy
+`/oem/printer_data/config/extended/rfid-spools.json`, the OpenRFID init
+script migrates it on first boot — the file is renamed to
+`rfid-spools.json.migrated` afterwards and never touched again.
+
+### Enabling tag writing
+
+NTAG215 writing is **off by default**. To enable it, open
+[firmware-config](firmware_config.md), navigate to **Snapmaker Components →
+RFID Tag Writing**, and choose **Enabled**. This sets `rfid_write = true`
+under `[components]` in `extended2.cfg`, which the OpenRFID init script
+plumbs through to the agent's `enable_write` flag. With the toggle off,
+the Spools UI hides the Write/Clear/Edit buttons and the agent rejects
+write requests.
+
+#### Write smoke test
+
+After enabling the toggle and rebooting:
+
+1. Hard-refresh `http://<printer>/spools/` (the SPA caches templates).
+2. Drop an NTAG215 tag on a reader. The channel row should show
+   **Edit**, **Write** and **Clear** buttons next to the tag info.
+3. Click **Edit**, change a field (e.g. colour), then **Write**. The
+   status line should report a successful write.
+4. Remove the tag and re-present it; the new value should appear on read.
+5. **Clear** wipes the tag back to factory state — useful when
+   re-authoring a partially-written tag.
+
+If the buttons don't appear, double-check `rfid_write` in
+`/oem/printer_data/config/extended/extended2.cfg`, then
+`/etc/init.d/S99openrfid restart` to reload the agent.
+
 ## Troubleshooting
 
 **Tag not detected:**
