@@ -1,0 +1,43 @@
+name: JavaScript tests
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'overlays/firmware-extended/68-app-filament-ui/**/*.js'
+      - 'tests/js/**'
+      - 'Makefile'
+      - '.github/workflows/javascript_tests.yaml'
+  pull_request:
+    paths:
+      - 'overlays/firmware-extended/68-app-filament-ui/**/*.js'
+      - 'tests/js/**'
+      - 'Makefile'
+      - '.github/workflows/javascript_tests.yaml'
+  workflow_dispatch:
+
+jobs:
+  node-test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check browser scripts
+        run: |
+          node --check overlays/firmware-extended/68-app-filament-ui/root/usr/local/filament-ui/html/script.js
+          node --check overlays/firmware-extended/68-app-filament-ui/root/usr/local/filament-ui/html/rfid-port.js
+          node --check overlays/firmware-extended/68-app-filament-ui/root/usr/local/filament-ui/html/spoolman-rfid-fields.js
+          node --check overlays/firmware-extended/68-app-filament-ui/root/usr/local/filament-ui/html/tigertag-authoring.js
+
+      - name: Run tests
+        run: make test-js

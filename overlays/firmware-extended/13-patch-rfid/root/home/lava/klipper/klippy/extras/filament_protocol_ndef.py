@@ -220,6 +220,7 @@ def openspool_parse_payload(payload, card_uid=[]):
         info['RSA_KEY_VERSION'] = 0
         info['OFFICIAL'] = True
         info['CARD_UID'] = card_uid
+        info['TAG_FORMAT'] = 'openspool'
 
         return filament_protocol.FILAMENT_PROTO_OK, info
 

@@ -10,7 +10,7 @@
      def _ready(self):
          self.filament_feed_objects = self.printer.lookup_objects('filament_feed')
          self._fm175xx_reader = self.printer.lookup_object('fm175xx_reader')
-@@ -173,6 +176,70 @@
+@@ -173,6 +176,72 @@
  
          return error, info
  
@@ -30,6 +30,8 @@
 +                filament_info['CARD_UID'] = [int(b) for b in params.pop('CARD_UID')]
 +            if 'CARD_TYPE' in params:
 +                filament_info['CARD_TYPE'] = str(params.pop('CARD_TYPE'))
++            if 'TAG_FORMAT' in params:
++                filament_info['TAG_FORMAT'] = str(params.pop('TAG_FORMAT'))
 +
 +            has_params = len(params) > 0
 +            if 'VENDOR' in params:

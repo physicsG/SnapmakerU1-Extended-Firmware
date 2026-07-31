@@ -28,3 +28,105 @@ settings:
                 /etc/init.d/S99openrfid restart
                 /etc/init.d/S60klipper restart
                 echo Please read the relevant documentation for this feature. Bambu Lab and Creality spools are not enabled by default.
+
+  openrfid:
+    label: OpenRFID
+    items:
+      openrfid-enable-write:
+        label: RFID Tag Writing
+        description: |
+          Allow Filament Manager to write the fixed TigerTag Maker region on
+          compatible NTAG21x tags. The installed OpenRFID build must also
+          contain the reviewed safe-writer marker.
+        get_cmd:
+          - /usr/local/bin/extended-config.py
+          - get
+          - /oem/printer_data/config/extended/extended2.cfg
+          - openrfid
+          - enable_write
+          - "false"
+        options:
+          "true":
+            label: Enabled
+            confirm: Enable RFID tag writing? Filament Manager will require confirmation before each mutation.
+            cmd:
+              - bash
+              - -xc
+              - |
+                /usr/local/bin/extended-config.py add /oem/printer_data/config/extended/extended2.cfg openrfid enable_write true
+                /etc/init.d/S99openrfid restart
+          "false":
+            label: Disabled
+            cmd:
+              - bash
+              - -xc
+              - |
+                /usr/local/bin/extended-config.py add /oem/printer_data/config/extended/extended2.cfg openrfid enable_write false
+                /etc/init.d/S99openrfid restart
+        default: "false"
+
+      openrfid-allow-unrecognized-write:
+        label: Initialize Blank RFID Tags
+        description: |
+          Permit explicitly confirmed initialization of a blank NTAG or a tag
+          whose existing payload is not recognized. Tag writing must also be
+          enabled; recognized protected formats remain server-side guarded.
+        get_cmd:
+          - /usr/local/bin/extended-config.py
+          - get
+          - /oem/printer_data/config/extended/extended2.cfg
+          - openrfid
+          - allow_unrecognized_write
+          - "false"
+        options:
+          "true":
+            label: Enabled
+            confirm: Allow initialization of blank or unrecognized NTAGs after an additional per-tag confirmation?
+            cmd:
+              - bash
+              - -xc
+              - |
+                /usr/local/bin/extended-config.py add /oem/printer_data/config/extended/extended2.cfg openrfid allow_unrecognized_write true
+                /etc/init.d/S99openrfid restart
+          "false":
+            label: Disabled
+            cmd:
+              - bash
+              - -xc
+              - |
+                /usr/local/bin/extended-config.py add /oem/printer_data/config/extended/extended2.cfg openrfid allow_unrecognized_write false
+                /etc/init.d/S99openrfid restart
+        default: "false"
+
+      openrfid-allow-legacy-migration-write:
+        label: Migrate Legacy OpenRFID Tags
+        description: |
+          Permit explicitly confirmed conversion of the exact retired
+          OpenRFID v1 tag format into an official TigerTag Maker record. Tag
+          writing must also be enabled.
+        get_cmd:
+          - /usr/local/bin/extended-config.py
+          - get
+          - /oem/printer_data/config/extended/extended2.cfg
+          - openrfid
+          - allow_legacy_migration_write
+          - "false"
+        options:
+          "true":
+            label: Enabled
+            confirm: Allow per-tag migration of the exact retired OpenRFID v1 format?
+            cmd:
+              - bash
+              - -xc
+              - |
+                /usr/local/bin/extended-config.py add /oem/printer_data/config/extended/extended2.cfg openrfid allow_legacy_migration_write true
+                /etc/init.d/S99openrfid restart
+          "false":
+            label: Disabled
+            cmd:
+              - bash
+              - -xc
+              - |
+                /usr/local/bin/extended-config.py add /oem/printer_data/config/extended/extended2.cfg openrfid allow_legacy_migration_write false
+                /etc/init.d/S99openrfid restart
+        default: "false"

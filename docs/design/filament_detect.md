@@ -33,6 +33,7 @@ Writable fields:
 | `BED_TEMP` | `int` | Integer | |
 | `CARD_UID` | `list[int]` | Array of byte ints | Indicates a tag is physically present; independent of filament data |
 | `CARD_TYPE` | `string` | `NTAG`, `M1` | Tag hardware type; independent of filament data |
+| `TAG_FORMAT` | `string` | `snapmaker`, `openspool`, `tigertag`, `bambu`, `creality`, `anycubic`, `elegoo`, `qidi`, `spoolease`, `unknown` | Decoded payload format; independent of hardware and `OFFICIAL` |
 | `SKU` | `int` | Integer | |
 
 Read-only fields (returned by query, not accepted by `set`):
@@ -40,7 +41,7 @@ Read-only fields (returned by query, not accepted by `set`):
 | Field | Notes |
 |---|---|
 | `ARGB_COLOR` | Derived: `(ALPHA << 24) \| RGB_1` |
-| `OFFICIAL` | `true` when `info` contains at least one filament field other than `CARD_UID` |
+| `OFFICIAL` | `true` when `info` contains at least one filament field other than `CARD_UID`, `CARD_TYPE`, and `TAG_FORMAT` |
 | `MANUFACTURER` | |
 | `VERSION` | |
 | `TRAY` | |
@@ -102,7 +103,7 @@ The endpoint has three modes determined by the filament fields present in `info`
 | Tag present, no data | `CARD_UID` only | `false` | Direct assignment; if the slot was previously official, `_filament_info_update` is called to clear it |
 | Clear | Missing or empty | `false` | Direct assignment; filament fields reset to `FILAMENT_INFO_STRUCT` defaults |
 
-`CARD_UID` and `CARD_TYPE` are both popped before `has_params` is computed, so they never contribute to `OFFICIAL`. `CARD_TYPE` is populated automatically on hardware reads (`NTAG` via `filament_protocol_ndef`, `M1` via `filament_protocol`).
+`CARD_UID`, `CARD_TYPE`, and `TAG_FORMAT` are popped before `has_params` is computed, so they never contribute to `OFFICIAL`. `CARD_TYPE` identifies the hardware family. `TAG_FORMAT` identifies the decoded payload: the built-in parsers report `snapmaker` or `openspool`, while OpenRFID projects its detected format for vendor and generic reads.
 
 ## openrfid Integration
 
