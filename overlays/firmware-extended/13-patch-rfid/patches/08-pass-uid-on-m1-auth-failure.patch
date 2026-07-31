@@ -1,6 +1,6 @@
 --- rootfs.original/home/lava/klipper/klippy/extras/fm175xx_reader.py
 +++ rootfs/home/lava/klipper/klippy/extras/fm175xx_reader.py
-@@ -1059,6 +1059,8 @@
+@@ -1059,5 +1059,7 @@
                              if (FM175XX_OK != ret.err_code):
                                  card_op_result = FM175XX_CARD_READ_ERR
 +                                card_data = list(self.__picc_a.UID[0:4])

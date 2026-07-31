@@ -70,6 +70,12 @@ firmware/$(FIRMWARE_FILE):
 test: firmware/$(FIRMWARE_FILE)
 	make -C tools test FIRMWARE_FILE=$(CURDIR)/firmware/$(FIRMWARE_FILE)
 
+# DOM-free JavaScript tests for the static firmware applications. Uses
+# Node's built-in test runner and requires no npm dependencies.
+.PHONY: test-js
+test-js:
+	node --test tests/js/*.test.js
+
 # ================= Helpers =================
 
 .PHONY: changelog

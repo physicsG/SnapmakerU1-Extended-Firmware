@@ -166,4 +166,3 @@ it does not maintain its own WebSocket connection.
    it onto `filament_protocol.FILAMENT_INFO_STRUCT` and applies it to `print_task_config`.
 7. Klipper stores the metadata in `print_task_config` and notifies subscribers.
    `AFC_lane.get_status()` surfaces `spool_id` to Fluidd/Mainsail.
-

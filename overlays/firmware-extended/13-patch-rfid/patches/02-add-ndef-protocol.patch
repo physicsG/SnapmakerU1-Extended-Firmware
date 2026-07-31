@@ -1,14 +1,13 @@
 diff -uNr rootfs.original/home/lava/klipper/klippy/extras/filament_detect.py rootfs/home/lava/klipper/klippy/extras/filament_detect.py
 --- rootfs.original/home/lava/klipper/klippy/extras/filament_detect.py	2025-11-06 05:01:19.000000000 +0100
 +++ rootfs/home/lava/klipper/klippy/extras/filament_detect.py	2025-12-01 23:11:18.373585258 +0100
-@@ -1,4 +1,5 @@
- import logging, os
+@@ -2,2 +2,3 @@
  from . import filament_protocol
 +from . import filament_protocol_ndef
  from . import fm175xx_reader
-
-@@ -123,6 +124,14 @@
+@@ -123,5 +124,14 @@
                      filament_info = info
++                    filament_info['TAG_FORMAT'] = 'snapmaker'
                  else:
                      logging.error("channel[%d] m1 parse err: %d", channel, error)
 +            elif fm175xx_reader.FM175XX_MIFARE_CARD_TYPE_NTAG == card_type and fm175xx_reader.FM175XX_OK == result:
@@ -21,4 +20,3 @@ diff -uNr rootfs.original/home/lava/klipper/klippy/extras/filament_detect.py roo
 +                    logging.error("channel[%d] NDEF parse err....", channel)
          else:
              is_clear = True
-

@@ -2,6 +2,10 @@
 
 PIDFILE="/var/run/openrfid.pid"
 EXTENDED2_CFG="/oem/printer_data/config/extended/extended2.cfg"
+STATIC_API_CFG="/usr/local/share/openrfid/extended/openrfid_api.cfg"
+API_OVERRIDE_CFG="/tmp/openrfid_api_overrides.cfg"
+SAFE_WRITER_MARKER="/usr/local/share/openrfid/SAFE_TIGERTAG_WRITER_V2"
+STOP_GRACE_SECONDS=60
 
 start() {
     RFID=$(/usr/local/bin/extended-config.py get "$EXTENDED2_CFG" components rfid snapmaker 2>/dev/null)
@@ -21,14 +25,48 @@ start() {
             ;;
     esac
 
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "OpenRFID already running"
-        return 0
+    if [ -f "$PIDFILE" ]; then
+        PID=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            echo "OpenRFID already running"
+            return 0
+        fi
+        rm -f "$PIDFILE"
     fi
 
     ADDITIONAL_CONFIG=/oem/printer_data/config/extended/openrfid_user.cfg
     if ! test -f "$ADDITIONAL_CONFIG"; then
         ADDITIONAL_CONFIG=""
+    fi
+
+    # The shipped API configuration is always loaded read-only. A final,
+    # generated override enables mutations only for a reviewed writer build
+    # and explicit firmware settings.
+    rm -f "$API_OVERRIDE_CFG"
+    API_OVERRIDE_CONFIG=""
+    RFID_WRITE=$(/usr/local/bin/extended-config.py get "$EXTENDED2_CFG" openrfid enable_write false 2>/dev/null)
+    if [ "$RFID_WRITE" = "true" ] && [ -f "$SAFE_WRITER_MARKER" ]; then
+        RFID_WRITE_UNRECOGNIZED=$(/usr/local/bin/extended-config.py get "$EXTENDED2_CFG" openrfid allow_unrecognized_write false 2>/dev/null)
+        case "$RFID_WRITE_UNRECOGNIZED" in
+            true|false) ;;
+            *) RFID_WRITE_UNRECOGNIZED=false ;;
+        esac
+
+        RFID_WRITE_LEGACY_MIGRATION=$(/usr/local/bin/extended-config.py get "$EXTENDED2_CFG" openrfid allow_legacy_migration_write false 2>/dev/null)
+        case "$RFID_WRITE_LEGACY_MIGRATION" in
+            true|false) ;;
+            *) RFID_WRITE_LEGACY_MIGRATION=false ;;
+        esac
+
+        cat >"$API_OVERRIDE_CFG" <<EOF
+[openrfid_api]
+enable_write = true
+allow_unrecognized_write = $RFID_WRITE_UNRECOGNIZED
+allow_legacy_migration_write = $RFID_WRITE_LEGACY_MIGRATION
+EOF
+        API_OVERRIDE_CONFIG="$API_OVERRIDE_CFG"
+    elif [ "$RFID_WRITE" = "true" ]; then
+        echo "OpenRFID: RFID writing requested but this pinned build lacks the reviewed SAFE_TIGERTAG_WRITER_V2 port; keeping writes disabled"
     fi
 
     printf "Starting OpenRFID: "
@@ -37,15 +75,33 @@ start() {
         -x /usr/bin/python3 -- /usr/local/bin/openrfid.py \
         /tmp/openrfid.cfg \
         /usr/local/share/openrfid/extended/openrfid_u1_base.cfg \
-        $DETECT_CONFIG \
-        $ADDITIONAL_CONFIG
+        "$DETECT_CONFIG" \
+        $ADDITIONAL_CONFIG \
+        "$STATIC_API_CFG" \
+        $API_OVERRIDE_CONFIG
     echo "OK"
 }
 
 stop() {
     printf "Stopping OpenRFID: "
     if [ -f "$PIDFILE" ]; then
-        start-stop-daemon -K -p "$PIDFILE" -s TERM
+        PID=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
+            rm -f "$PIDFILE"
+            echo "stale pidfile removed"
+            return 0
+        fi
+
+        start-stop-daemon -K -p "$PIDFILE" -s TERM || return 1
+        i=0
+        while kill -0 "$PID" 2>/dev/null && [ $i -lt $STOP_GRACE_SECONDS ]; do
+            sleep 1
+            i=$((i + 1))
+        done
+        if kill -0 "$PID" 2>/dev/null; then
+            echo "timeout waiting for safe writer shutdown; process left running"
+            return 1
+        fi
         rm -f "$PIDFILE"
         echo "OK"
     else
@@ -61,9 +117,10 @@ case "$1" in
         stop
         ;;
     restart|reload)
-        stop
-        sleep 1
-        start
+        stop && {
+            sleep 1
+            start
+        }
         ;;
     *)
         echo "Usage: $0 {start|stop|restart}"

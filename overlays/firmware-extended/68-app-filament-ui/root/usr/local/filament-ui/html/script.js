@@ -26,6 +26,27 @@ const SPOOL_REFRESH_ACTIVE_MS = 3000;
 const SPOOL_REFRESH_IDLE_MS = 30000;
 let spoolPickerSpools = [];
 let spoolPickerCurrentId = null;
+let spoolPickerContext = null;
+let spoolmanFieldStatusRows = [];
+let spoolmanSyncContext = null;
+let spoolmanSyncPlan = null;
+let openRfidAvailable = false;
+let openRfidWriteEnabled = false;
+let openRfidApi = null;
+const openRfidChannelCapabilities = new Map();
+const openRfidScans = new Map();
+const openRfidSlotGenerations = [0, 0, 0, 0];
+let openRfidDiscoveryTimer = null;
+let openRfidDiscoveryAttempt = 0;
+let tigerTagOptions = null;
+let tigerTagAuthoringContext = null;
+let tigerTagAuthoringPreview = null;
+let tigerTagAuthoringBusy = false;
+const tigerTagUncertainOperations = new Map();
+
+const OPENRFID_AGENT = 'openrfid';
+const OPENRFID_SCAN_EVENT = 'openrfid/scan';
+const OPENRFID_DISCOVERY_MAX_ATTEMPTS = 6;
 
 // Last known full status — merged incrementally from notify_status_update
 let cachedStatus = {
@@ -65,6 +86,14 @@ function initializeWebSocket() {
     ws.onclose = () => {
         wsReady = false;
         subscribed = false;
+        openRfidAvailable = false;
+        openRfidWriteEnabled = false;
+        openRfidApi = null;
+        openRfidChannelCapabilities.clear();
+        openRfidScans.clear();
+        if (openRfidDiscoveryTimer) clearTimeout(openRfidDiscoveryTimer);
+        openRfidDiscoveryTimer = null;
+        openRfidDiscoveryAttempt = 0;
         setConnectionStatus(false);
         showStatus('Disconnected — reconnecting…', 'error');
         setTimeout(initializeWebSocket, 2000);
@@ -75,15 +104,19 @@ function initializeWebSocket() {
     ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
 
+        if (msg.method === 'notify_agent_event') {
+            const notification = Array.isArray(msg.params) ? msg.params[0] : msg.params;
+            if (notification?.agent === OPENRFID_AGENT
+                    && notification.event === OPENRFID_SCAN_EVENT) {
+                void acceptOpenRfidScan(notification.data || {}, true);
+            }
+            return;
+        }
+
         // Push update from subscription
         if (msg.method === 'notify_status_update') {
             const update = msg.params[0];
-            if (update.filament_detect) {
-                Object.assign(cachedStatus.filament_detect, update.filament_detect);
-            }
-            if (update.print_task_config) {
-                Object.assign(cachedStatus.print_task_config, update.print_task_config);
-            }
+            mergeStatus(update);
             rebuildFromCache();
             return;
         }
@@ -127,6 +160,100 @@ async function sendGcode(gcode) {
     }
 }
 
+function openRfidRequest(method, arguments_ = {}) {
+    return sendRPC('server.extensions.request', {
+        agent: OPENRFID_AGENT,
+        method,
+        arguments: arguments_,
+    });
+}
+
+function cachedUidForSlot(slot) {
+    const info = cachedStatus.filament_detect?.info?.[slot] || {};
+    return RfidPort.normalizeUid(info.CARD_UID);
+}
+
+function invalidateOpenRfidSlot(slot) {
+    if (!Number.isInteger(slot) || slot < 0 || slot >= openRfidSlotGenerations.length) return;
+    openRfidSlotGenerations[slot] += 1;
+    openRfidScans.delete(slot);
+}
+
+function markOpenRfidAvailable() {
+    openRfidAvailable = true;
+    openRfidDiscoveryAttempt = 0;
+    if (openRfidDiscoveryTimer) clearTimeout(openRfidDiscoveryTimer);
+    openRfidDiscoveryTimer = null;
+}
+
+function scheduleOpenRfidDiscovery() {
+    if (!wsReady || openRfidDiscoveryTimer
+            || openRfidDiscoveryAttempt >= OPENRFID_DISCOVERY_MAX_ATTEMPTS) return;
+    const delay = Math.min(30000, 1000 * (2 ** openRfidDiscoveryAttempt));
+    openRfidDiscoveryAttempt += 1;
+    openRfidDiscoveryTimer = setTimeout(() => {
+        openRfidDiscoveryTimer = null;
+        void loadOpenRfidChannels();
+    }, delay);
+}
+
+async function acceptOpenRfidScan(scan, confirmWithPrinter) {
+    const slot = Number(scan?.slot);
+    if (!Number.isInteger(slot) || slot < 0 || slot >= 4) return false;
+
+    const generation = openRfidSlotGenerations[slot];
+    let printerUid = cachedUidForSlot(slot);
+    if (confirmWithPrinter) {
+        try {
+            const status = await queryAndSubscribe();
+            const confirmedInfo = status?.filament_detect?.info?.[slot] || {};
+            const confirmedUid = RfidPort.normalizeUid(confirmedInfo.CARD_UID);
+            if (generation !== openRfidSlotGenerations[slot]
+                    || confirmedUid !== cachedUidForSlot(slot)) return false;
+            printerUid = confirmedUid;
+        } catch (_err) {
+            return false;
+        }
+    }
+
+    if (!RfidPort.shouldAcceptScan(scan, printerUid, openRfidScans.get(slot))) return false;
+
+    markOpenRfidAvailable();
+    openRfidScans.set(slot, { ...scan, _presenceGeneration: generation });
+    rebuildFromCache();
+    return true;
+}
+
+async function loadOpenRfidChannels() {
+    try {
+        const result = await openRfidRequest('openrfid/list_channels');
+        if (!result || typeof result !== 'object') throw new Error('Invalid OpenRFID channel response');
+        markOpenRfidAvailable();
+        openRfidApi = result;
+        openRfidWriteEnabled = result?.write_enabled === true;
+        openRfidChannelCapabilities.clear();
+        const channels = Array.isArray(result?.channels) ? result.channels : [];
+        for (const channel of channels) {
+            const slot = Number(channel?.slot);
+            if (Number.isInteger(slot) && slot >= 0) {
+                openRfidChannelCapabilities.set(slot, channel.capabilities || {});
+            }
+            if (channel?.last_scan) await acceptOpenRfidScan(channel.last_scan, false);
+        }
+        rebuildFromCache();
+        return result;
+    } catch (_err) {
+        openRfidAvailable = false;
+        openRfidWriteEnabled = false;
+        openRfidApi = null;
+        openRfidChannelCapabilities.clear();
+        openRfidScans.clear();
+        rebuildFromCache();
+        scheduleOpenRfidDiscovery();
+        return null;
+    }
+}
+
 async function queryAndSubscribe() {
     if (!subscribed) {
         await sendRPC('printer.objects.subscribe', { objects: QUERY_OBJECTS });
@@ -149,24 +276,28 @@ function setConnectionStatus(connected) {
 
 // ── Initial data load (no gcodes — shows existing printer state) ──────────
 
-function loadSpoolmanStatus() {
-    sendRPC('server.spoolman.status').then(status => {
-        if (status.spoolman_connected) {
-            spoolmanActive = true;
-            if (!spoolRefreshTimer) scheduleSpoolRefresh();
-        }
-    }).catch(() => {});
-
-    sendRPC('server.config').then(config => {
-        spoolmanUrl = config.config?.spoolman?.server || null;
-    }).catch(() => {});
+async function loadSpoolmanStatus() {
+    const [statusResult, configResult] = await Promise.allSettled([
+        sendRPC('server.spoolman.status'),
+        sendRPC('server.config'),
+    ]);
+    spoolmanActive = statusResult.status === 'fulfilled'
+        && statusResult.value?.spoolman_connected === true;
+    if (configResult.status === 'fulfilled') {
+        spoolmanUrl = configResult.value?.config?.spoolman?.server || null;
+    }
+    const fieldsButton = document.getElementById('spoolman-fields-button');
+    if (fieldsButton) fieldsButton.style.display = spoolmanActive ? '' : 'none';
+    if (spoolmanActive && !spoolRefreshTimer) scheduleSpoolRefresh();
 }
 
 async function loadInitialData() {
     try {
-        const [status] = await Promise.all([queryAndSubscribe(), loadSpoolmanStatus()]);
+        const status = await queryAndSubscribe();
         mergeStatus(status);
         rebuildFromCache();
+        await loadSpoolmanStatus();
+        await loadOpenRfidChannels();
         if (spoolmanActive) await refreshSpoolWeights();
     } catch (err) {
         showStatus(`Load failed: ${err.message}`, 'error');
@@ -175,15 +306,1268 @@ async function loadInitialData() {
 
 async function fetchSpoolmanAllSpools() {
     try {
-        const result = await sendRPC('server.spoolman.proxy', { request_method: 'GET', path: '/v1/spool' });
+        const result = await sendRPC('server.spoolman.proxy', { request_method: 'GET', path: '/v1/spool?limit=1000' });
         return Array.isArray(result) ? result : [];
     } catch { return []; }
+}
+
+function spoolmanProxy(requestMethod, path, body) {
+    const params = { request_method: requestMethod, path };
+    if (body !== undefined) params.body = body;
+    return sendRPC('server.spoolman.proxy', params);
 }
 
 async function fetchSpoolmanSpool(id) {
     try {
         return await sendRPC('server.spoolman.proxy', { request_method: 'GET', path: `/v1/spool/${id}` });
     } catch { return null; }
+}
+
+function setSpoolmanFieldsMessage(message, kind = '') {
+    const element = document.getElementById('spoolman-fields-status');
+    if (!element) return;
+    element.textContent = message || '';
+    element.className = 'spoolman-fields-message' + (kind ? ` ${kind}` : '');
+}
+
+function renderSpoolmanFieldRows(rows) {
+    const container = document.getElementById('spoolman-fields-list');
+    container.innerHTML = '';
+    const groups = [
+        ['core', 'Core - managed by SpoolLink'],
+        ['optional', 'Optional RFID metadata'],
+        ['legacy', 'Legacy - migration only'],
+    ];
+    for (const [group, title] of groups) {
+        const groupRows = rows.filter(row => row.group === group);
+        const heading = document.createElement('h3');
+        heading.className = 'spoolman-fields-group-title';
+        heading.textContent = title;
+        container.appendChild(heading);
+        for (const row of groupRows) {
+            const item = document.createElement('label');
+            item.className = 'spoolman-field-row';
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.disabled = !row.selectable;
+            checkbox.dataset.fieldKey = `${row.entity}.${row.key}`;
+            checkbox.setAttribute('aria-label', `Create ${row.name}`);
+
+            const name = document.createElement('span');
+            name.className = 'spoolman-field-name';
+            name.textContent = row.name;
+            const key = document.createElement('span');
+            key.className = 'spoolman-field-key';
+            key.textContent = `${row.entity}.${row.key} (${row.expectedType})`;
+            name.appendChild(document.createElement('br'));
+            name.appendChild(key);
+
+            const status = document.createElement('span');
+            status.className = `spoolman-field-status ${row.status.toLowerCase().replace(/\s+/g, '-')}`;
+            status.textContent = row.status === 'Type mismatch'
+                ? `Type mismatch: ${row.actualType || 'unknown'}`
+                : row.status;
+            item.append(checkbox, name, status);
+            container.appendChild(item);
+        }
+    }
+}
+
+async function loadSpoolmanFieldStatusRows() {
+    const [spoolFields, filamentFields] = await Promise.all([
+        spoolmanProxy('GET', '/v1/field/spool'),
+        spoolmanProxy('GET', '/v1/field/filament'),
+    ]);
+    return SpoolmanRfidFields.buildFieldStatus({
+        spool: spoolFields,
+        filament: filamentFields,
+    });
+}
+
+async function refreshSpoolmanFieldStatus() {
+    const list = document.getElementById('spoolman-fields-list');
+    list.innerHTML = '<div class="spoolman-loading"><span class="spinner"></span> Reading Spoolman schema...</div>';
+    setSpoolmanFieldsMessage('');
+    try {
+        spoolmanFieldStatusRows = await loadSpoolmanFieldStatusRows();
+        renderSpoolmanFieldRows(spoolmanFieldStatusRows);
+        return true;
+    } catch (err) {
+        spoolmanFieldStatusRows = [];
+        list.innerHTML = '';
+        setSpoolmanFieldsMessage(`Could not read Spoolman fields: ${err.message || err}`, 'error');
+        return false;
+    }
+}
+
+function openSpoolmanFields() {
+    openModal('spoolman-fields-modal');
+    void refreshSpoolmanFieldStatus();
+}
+
+async function addSelectedSpoolmanFields() {
+    const selected = new Set(
+        [...document.querySelectorAll('#spoolman-fields-list input[data-field-key]:checked')]
+            .map(input => input.dataset.fieldKey)
+    );
+    const definitions = SpoolmanRfidFields.getSelectedMissingOptionalFields(
+        spoolmanFieldStatusRows,
+        selected
+    );
+    if (!definitions.length) {
+        setSpoolmanFieldsMessage('Select at least one missing optional field.');
+        return;
+    }
+
+    const button = document.getElementById('spoolman-fields-add');
+    button.disabled = true;
+    setSpoolmanFieldsMessage('Creating selected fields...');
+    const results = await Promise.all(definitions.map(async definition => {
+        try {
+            await spoolmanProxy(
+                'POST',
+                `/v1/field/${definition.entity}/${definition.key}`,
+                { name: definition.name, field_type: definition.field_type }
+            );
+            return { definition, ok: true };
+        } catch (error) {
+            return { definition, ok: false, error };
+        }
+    }));
+    button.disabled = false;
+
+    const failures = results.filter(result => !result.ok);
+    const refreshOk = await refreshSpoolmanFieldStatus();
+    if (!refreshOk) {
+        setSpoolmanFieldsMessage(
+            `${results.length - failures.length} field(s) created, but schema verification failed. Refresh and verify before using them.`,
+            'error'
+        );
+        return;
+    }
+    if (failures.length) {
+        const details = failures.map(result =>
+            `${result.definition.key}: ${result.error?.message || result.error}`
+        ).join('; ');
+        setSpoolmanFieldsMessage(
+            `${results.length - failures.length} created, ${failures.length} failed - ${details}`,
+            'error'
+        );
+    } else {
+        setSpoolmanFieldsMessage(`${results.length} field(s) created.`, 'success');
+    }
+}
+
+function spoolmanSyncErrorText(error) {
+    return error?.message || error?.error?.message || String(error || 'Unknown error');
+}
+
+function setSpoolmanSyncMessage(message, kind = '') {
+    const element = document.getElementById('spoolman-sync-status');
+    if (!element) return;
+    element.textContent = message || '';
+    element.className = 'spoolman-fields-message' + (kind ? ` ${kind}` : '');
+}
+
+function formatSpoolmanSyncValue(row, value, proposed = false) {
+    const decoded = row.kind === 'extra'
+        ? SpoolmanRfidFields.decodeExtraValue(value)
+        : value;
+    if (decoded === null || decoded === undefined || decoded === '') {
+        return proposed && row.key === 'multi_color_hexes' ? '(clear)' : '(empty)';
+    }
+    if (row.key === 'color_hex') return `#${String(decoded).replace(/^#/, '').toUpperCase()}`;
+    if (row.key === 'multi_color_hexes') {
+        return String(decoded).split(',').map(color => `#${color.trim().replace(/^#/, '').toUpperCase()}`).join(', ');
+    }
+    if (row.key.includes('temp')) return `${decoded} C`;
+    if (row.key === 'diameter' || row.key === 'td') return `${decoded} mm`;
+    if (row.key === 'drying_time') return `${decoded} h`;
+    if (Array.isArray(decoded)) return decoded.join(', ');
+    if (decoded && typeof decoded === 'object') return JSON.stringify(decoded);
+    return String(decoded);
+}
+
+function currentSpoolmanSyncChannel(context = spoolmanSyncContext) {
+    if (!context) return null;
+    const channel = channelsData.find(item => item.channel === context.channel);
+    if (!channel || !channel.decoded || channel.physical?.state !== 'read') return null;
+    if (Number(channel.spool_id) !== Number(context.spoolId)) return null;
+    if (RfidPort.normalizeUid(channel.physical?.uidHex) !== context.uid) return null;
+    if (openRfidSlotGenerations[context.channel] !== context.generation) return null;
+    return channel;
+}
+
+function selectedSpoolmanSyncIds() {
+    return new Set(
+        [...document.querySelectorAll('#spoolman-sync-list input[data-sync-id]:checked')]
+            .map(input => input.dataset.syncId)
+    );
+}
+
+function updateSpoolmanSyncSelectionMessage() {
+    const button = document.getElementById('spoolman-sync-apply');
+    if (!spoolmanSyncPlan?.ok) {
+        button.disabled = true;
+        return;
+    }
+    const selected = SpoolmanRfidFields.selectedSyncRows(
+        spoolmanSyncPlan,
+        selectedSpoolmanSyncIds()
+    );
+    button.disabled = selected.length === 0;
+    const conflicts = selected.filter(row => row.conflict).length;
+    setSpoolmanSyncMessage(
+        selected.length
+            ? `${selected.length} field(s) selected${conflicts ? `; ${conflicts} existing value(s) will be replaced after confirmation` : ''}.`
+            : 'Select at least one changed field. Different non-empty values are unchecked by default.'
+    );
+}
+
+function renderSpoolmanSyncPlan(plan) {
+    const container = document.getElementById('spoolman-sync-list');
+    container.innerHTML = '';
+    const groups = [
+        ['native', 'Spoolman filament fields'],
+        ['extra', 'Registered RFID metadata fields'],
+    ];
+
+    for (const [kind, title] of groups) {
+        const rows = plan.rows.filter(row => row.kind === kind);
+        if (!rows.length) continue;
+        const heading = document.createElement('h3');
+        heading.className = 'spoolman-fields-group-title';
+        heading.textContent = title;
+        container.appendChild(heading);
+
+        for (const row of rows) {
+            const item = document.createElement('label');
+            item.className = `spoolman-sync-row ${row.state}`;
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.disabled = !row.selectable;
+            checkbox.checked = row.selectedByDefault;
+            checkbox.dataset.syncId = row.id;
+            checkbox.setAttribute('aria-label', `Sync ${row.label}`);
+            checkbox.addEventListener('change', updateSpoolmanSyncSelectionMessage);
+
+            const details = document.createElement('span');
+            details.className = 'spoolman-sync-details';
+            const name = document.createElement('span');
+            name.className = 'spoolman-sync-name';
+            name.textContent = row.label;
+            const key = document.createElement('span');
+            key.className = 'spoolman-field-key';
+            key.textContent = row.id;
+            const values = document.createElement('span');
+            values.className = 'spoolman-sync-values';
+            const current = document.createElement('span');
+            current.textContent = `Current: ${formatSpoolmanSyncValue(row, row.current)}`;
+            const proposed = document.createElement('span');
+            proposed.textContent = `Tag: ${formatSpoolmanSyncValue(row, row.value, true)}`;
+            values.append(current, proposed);
+            details.append(name, key, values);
+
+            const state = document.createElement('span');
+            state.className = `spoolman-sync-state ${row.state}`;
+            state.textContent = row.state === 'add' ? 'New'
+                : row.state === 'conflict' ? 'Different'
+                    : row.state === 'same' ? 'Same' : 'Unavailable';
+            state.title = row.note || '';
+            item.append(checkbox, details, state);
+            container.appendChild(item);
+        }
+    }
+    updateSpoolmanSyncSelectionMessage();
+}
+
+async function loadCurrentSpoolmanSyncPlan(context = spoolmanSyncContext) {
+    if (!currentSpoolmanSyncChannel(context)) {
+        throw new Error('The scanned tag or assigned spool changed; reopen the preview.');
+    }
+    const [spool, statusRows] = await Promise.all([
+        spoolmanProxy('GET', `/v1/spool/${context.spoolId}`),
+        loadSpoolmanFieldStatusRows(),
+    ]);
+    if (!currentSpoolmanSyncChannel(context)) {
+        throw new Error('The scanned tag or assigned spool changed while loading.');
+    }
+    const channel = currentSpoolmanSyncChannel(context);
+    const plan = SpoolmanRfidFields.buildMetadataSyncPlan(
+        channel.decoded,
+        channel.physical,
+        spool,
+        statusRows
+    );
+    if (!plan.ok) throw new Error(plan.errors.join('; '));
+    return { plan, spool, statusRows };
+}
+
+async function openSpoolmanMetadataSync(channelNumber) {
+    const channel = channelsData.find(item => item.channel === channelNumber);
+    if (!spoolmanActive) {
+        showStatus('Spoolman is not connected', 'error');
+        return;
+    }
+    if (!channel?.decoded || channel.physical?.state !== 'read') {
+        showStatus('Read a supported tag with OpenRFID before syncing metadata', 'error');
+        return;
+    }
+    if (channel.spool_id == null) {
+        showStatus('Assign a Spoolman spool before syncing metadata', 'error');
+        return;
+    }
+    const uid = RfidPort.normalizeUid(channel.physical?.uidHex);
+    if (!uid) {
+        showStatus('The current scan has no verified card UID', 'error');
+        return;
+    }
+
+    spoolmanSyncContext = {
+        channel: channelNumber,
+        spoolId: channel.spool_id,
+        uid,
+        generation: openRfidSlotGenerations[channelNumber],
+    };
+    spoolmanSyncPlan = null;
+    document.getElementById('spoolman-sync-title').textContent =
+        `Sync Tag to Spoolman - Extruder ${channelNumber + 1}`;
+    document.getElementById('spoolman-sync-intro').textContent =
+        `Previewing tag metadata for spool #${channel.spool_id}. UID ownership is unchanged and remains managed by SpoolLink.`;
+    document.getElementById('spoolman-sync-list').innerHTML =
+        '<div class="spoolman-loading"><span class="spinner"></span> Loading tag, spool, and field schema...</div>';
+    document.getElementById('spoolman-sync-apply').disabled = true;
+    setSpoolmanSyncMessage('');
+    openModal('spoolman-sync-modal');
+
+    const context = spoolmanSyncContext;
+    try {
+        const loaded = await loadCurrentSpoolmanSyncPlan(context);
+        if (spoolmanSyncContext !== context) return;
+        spoolmanSyncPlan = loaded.plan;
+        renderSpoolmanSyncPlan(spoolmanSyncPlan);
+    } catch (error) {
+        if (spoolmanSyncContext !== context) return;
+        spoolmanSyncPlan = null;
+        document.getElementById('spoolman-sync-list').innerHTML = '';
+        setSpoolmanSyncMessage(`Cannot build sync preview: ${spoolmanSyncErrorText(error)}`, 'error');
+    }
+}
+
+function closeSpoolmanMetadataSync() {
+    spoolmanSyncContext = null;
+    spoolmanSyncPlan = null;
+    closeModal('spoolman-sync-modal');
+}
+
+async function applySpoolmanMetadataSync() {
+    if (!spoolmanSyncContext || !spoolmanSyncPlan?.ok) return;
+    const context = spoolmanSyncContext;
+    const requestedIds = selectedSpoolmanSyncIds();
+    if (!requestedIds.size) {
+        setSpoolmanSyncMessage('Select at least one changed field.', 'error');
+        return;
+    }
+
+    const button = document.getElementById('spoolman-sync-apply');
+    button.disabled = true;
+    setSpoolmanSyncMessage('Rechecking the tag, spool, and schema before writing...');
+    try {
+        const loaded = await loadCurrentSpoolmanSyncPlan(context);
+        if (spoolmanSyncContext !== context) return;
+        const latestPlan = loaded.plan;
+        const availableIds = new Set(
+            latestPlan.rows.filter(row => row.selectable).map(row => row.id)
+        );
+        const changedIds = new Set([...requestedIds].filter(id => availableIds.has(id)));
+        const unavailable = [...requestedIds].filter(id => !availableIds.has(id));
+        if (unavailable.length) {
+            throw new Error(`Field availability changed: ${unavailable.join(', ')}. Review the preview again.`);
+        }
+
+        const selectedRows = SpoolmanRfidFields.selectedSyncRows(latestPlan, changedIds);
+        const conflicts = selectedRows.filter(row => row.conflict);
+        if (conflicts.length && !window.confirm(
+            `Replace ${conflicts.length} different non-empty Spoolman value(s)?\n\n` +
+            conflicts.map(row => row.label).join('\n')
+        )) {
+            spoolmanSyncPlan = latestPlan;
+            renderSpoolmanSyncPlan(latestPlan);
+            setSpoolmanSyncMessage('No changes written. Review and select fields to continue.');
+            return;
+        }
+
+        const built = SpoolmanRfidFields.buildFilamentPatch(latestPlan, changedIds, true);
+        setSpoolmanSyncMessage(`Writing ${built.rows.length} selected field(s)...`);
+        await spoolmanProxy('PATCH', `/v1/filament/${built.filamentId}`, built.patch);
+        const verifiedSpool = await spoolmanProxy('GET', `/v1/spool/${context.spoolId}`);
+        const verification = SpoolmanRfidFields.verifyFilamentPatch(
+            latestPlan,
+            changedIds,
+            verifiedSpool
+        );
+        if (!verification.ok) {
+            throw new Error(`Spoolman read-back did not match: ${verification.mismatches.join(', ')}`);
+        }
+
+        spoolmanSpools.set(context.spoolId, verifiedSpool);
+        if (spoolmanSyncContext === context) {
+            const currentChannel = currentSpoolmanSyncChannel(context);
+            spoolmanSyncPlan = SpoolmanRfidFields.buildMetadataSyncPlan(
+                currentChannel?.decoded,
+                currentChannel?.physical,
+                verifiedSpool,
+                loaded.statusRows
+            );
+            if (spoolmanSyncPlan.ok) renderSpoolmanSyncPlan(spoolmanSyncPlan);
+            setSpoolmanSyncMessage(
+                `${verification.verified.length} field(s) synced and verified. UID ownership was not changed.`,
+                'success'
+            );
+        }
+        showStatus(`Spool #${context.spoolId} metadata synced`, 'success');
+    } catch (error) {
+        if (spoolmanSyncContext === context) {
+            setSpoolmanSyncMessage(`Sync failed: ${spoolmanSyncErrorText(error)}`, 'error');
+        }
+        showStatus(`Spoolman metadata sync failed: ${spoolmanSyncErrorText(error)}`, 'error');
+    } finally {
+        if (spoolmanSyncContext === context && spoolmanSyncPlan?.ok) {
+            button.disabled = SpoolmanRfidFields.selectedSyncRows(
+                spoolmanSyncPlan,
+                selectedSpoolmanSyncIds()
+            ).length === 0;
+        } else {
+            button.disabled = true;
+        }
+    }
+}
+
+function openRfidResultError(result, fallback) {
+    if (!result || typeof result !== 'object') return fallback;
+    const detail = result.error || result.message || fallback;
+    return result.code ? `${detail} (${result.code})` : detail;
+}
+
+function requireOpenRfidResult(result, fallback) {
+    if (!result || result.ok !== true) throw new Error(openRfidResultError(result, fallback));
+    return result;
+}
+
+async function loadTigerTagOptions(force = false) {
+    if (tigerTagOptions && !force) return tigerTagOptions;
+    const result = requireOpenRfidResult(
+        await openRfidRequest('openrfid/tigertag_options'),
+        'TigerTag registry options are unavailable'
+    );
+    const groups = ['materials', 'brands', 'aspects', 'types', 'diameters', 'units'];
+    if (groups.some(group => !Array.isArray(result[group]))) {
+        throw new Error('OpenRFID returned an incomplete TigerTag registry');
+    }
+    tigerTagOptions = result;
+    return result;
+}
+
+function tigerTagOptionLabel(group, value) {
+    return TigerTagAuthoring.optionRecord(tigerTagOptions, group, value)?.label || String(value ?? '');
+}
+
+function populateTigerTagSelect(elementId, group, optional) {
+    const select = document.getElementById(elementId);
+    select.innerHTML = '';
+    if (optional) {
+        const empty = document.createElement('option');
+        empty.value = '';
+        empty.textContent = 'Not set (ID 0)';
+        select.appendChild(empty);
+    }
+    for (const record of tigerTagOptions[group]) {
+        const option = document.createElement('option');
+        option.value = String(record.id);
+        option.textContent = `${record.label} (${record.id})`;
+        select.appendChild(option);
+    }
+}
+
+function populateTigerTagRegistryControls() {
+    populateTigerTagSelect('tigertag-product-type', 'types', true);
+    populateTigerTagSelect('tigertag-material', 'materials', false);
+    populateTigerTagSelect('tigertag-brand', 'brands', true);
+    populateTigerTagSelect('tigertag-aspect-1', 'aspects', true);
+    populateTigerTagSelect('tigertag-aspect-2', 'aspects', true);
+    populateTigerTagSelect('tigertag-diameter', 'diameters', true);
+    populateTigerTagSelect('tigertag-unit', 'units', true);
+    const sdk = tigerTagOptions.sdk || {};
+    document.getElementById('tigertag-sdk').textContent = [
+        sdk.name || 'TigerTag SDK',
+        sdk.version ? `v${sdk.version}` : '',
+        sdk.commit ? `@${String(sdk.commit).slice(0, 8)}` : '',
+    ].filter(Boolean).join(' ');
+}
+
+function setTigerTagSelect(elementId, group, value) {
+    const select = document.getElementById(elementId);
+    const record = TigerTagAuthoring.optionRecord(tigerTagOptions, group, value);
+    select.value = record ? String(record.id) : '';
+}
+
+function defaultTigerTagDraft() {
+    const find = (group, labels) => {
+        for (const label of labels) {
+            const record = TigerTagAuthoring.optionRecord(tigerTagOptions, group, label);
+            if (record) return record;
+        }
+        return tigerTagOptions[group][0] || null;
+    };
+    const material = find('materials', ['PLA']);
+    const recommended = material?.recommended || {};
+    return {
+        inventoryName: '',
+        material: material?.id ?? '',
+        brand: find('brands', ['Generic', 'None'])?.id ?? '',
+        aspect1: find('aspects', ['Basic', '-'])?.id ?? '',
+        aspect2: find('aspects', ['-', 'None'])?.id ?? '',
+        productType: find('types', ['Filament'])?.id ?? '',
+        diameter: find('diameters', ['1.75'])?.id ?? '',
+        colors: ['FFFFFF'],
+        storedColors: ['FFFFFF', '000000', '000000'],
+        primaryColorAlpha: 255,
+        measure: 1000,
+        measureAvailable: 1000,
+        unit: find('units', ['g', 'Gram'])?.id ?? '',
+        nozzleMin: recommended.nozzleTempMin ?? 190,
+        nozzleMax: recommended.nozzleTempMax ?? 230,
+        dryTemp: recommended.dryTemp ?? 50,
+        dryTime: recommended.dryTime ?? 8,
+        bedMin: recommended.bedTempMin ?? 45,
+        bedMax: recommended.bedTempMax ?? 60,
+        manufacturingDate: new Date().toISOString().slice(0, 10),
+        tdMm: 0,
+        message: '',
+    };
+}
+
+function tigerTagColorCount() {
+    const first = TigerTagAuthoring.optionRecord(
+        tigerTagOptions, 'aspects', document.getElementById('tigertag-aspect-1').value
+    );
+    const second = TigerTagAuthoring.optionRecord(
+        tigerTagOptions, 'aspects', document.getElementById('tigertag-aspect-2').value
+    );
+    const firstCount = Number(first?.color_count || 0);
+    const secondCount = Number(second?.color_count || 0);
+    if (secondCount > 1) return Math.min(secondCount, 3);
+    if (firstCount > 1) return Math.min(firstCount, 3);
+    return 1;
+}
+
+function updateTigerTagColorActivity() {
+    if (!tigerTagOptions) return;
+    const active = tigerTagColorCount();
+    for (let index = 1; index <= 3; index++) {
+        const input = document.getElementById(`tigertag-color-${index}`);
+        input.closest('label').classList.toggle('inactive', index > active);
+    }
+    document.getElementById('tigertag-color-hint').textContent =
+        `${active} active color${active === 1 ? '' : 's'} from the selected aspects. Dormant colors remain stored for lossless editing.`;
+}
+
+function setTigerTagMessageByteCount() {
+    const message = document.getElementById('tigertag-message').value;
+    const bytes = TigerTagAuthoring.utf8ByteLength(message);
+    const element = document.getElementById('tigertag-message-bytes');
+    element.textContent = `${bytes} / 28 UTF-8 bytes`;
+    element.classList.toggle('error', bytes > 28);
+}
+
+function applyTigerTagDraft(draft, source) {
+    if (!tigerTagAuthoringContext) return;
+    const normalized = { ...defaultTigerTagDraft(), ...(draft || {}) };
+    const storedColors = Array.isArray(normalized.storedColors)
+        ? normalized.storedColors.slice(0, 3)
+        : (Array.isArray(normalized.colors) ? normalized.colors.slice(0, 3) : []);
+    while (storedColors.length < 3) storedColors.push('000000');
+    normalized.storedColors = storedColors;
+    tigerTagAuthoringContext.draft = normalized;
+    tigerTagAuthoringContext.source = source;
+    tigerTagAuthoringPreview = null;
+
+    setTigerTagSelect('tigertag-product-type', 'types', normalized.productType);
+    setTigerTagSelect('tigertag-material', 'materials', normalized.material);
+    setTigerTagSelect('tigertag-brand', 'brands', normalized.brand);
+    setTigerTagSelect('tigertag-aspect-1', 'aspects', normalized.aspect1);
+    setTigerTagSelect('tigertag-aspect-2', 'aspects', normalized.aspect2);
+    setTigerTagSelect('tigertag-diameter', 'diameters', normalized.diameter);
+    setTigerTagSelect('tigertag-unit', 'units', normalized.unit);
+    storedColors.forEach((color, index) => {
+        const normalizedColor = TigerTagAuthoring.normalizeColor(color) || '000000';
+        document.getElementById(`tigertag-color-${index + 1}`).value = `#${normalizedColor}`;
+    });
+    document.getElementById('tigertag-color-alpha').value =
+        normalized.primaryColorAlpha ?? normalized.colorAlpha ?? normalized.alpha ?? 255;
+    document.getElementById('tigertag-measure').value = normalized.measure ?? 0;
+    document.getElementById('tigertag-measure-available').value = normalized.measureAvailable ?? 0;
+    document.getElementById('tigertag-nozzle-min').value = normalized.nozzleMin ?? 0;
+    document.getElementById('tigertag-nozzle-max').value = normalized.nozzleMax ?? 0;
+    document.getElementById('tigertag-bed-min').value = normalized.bedMin ?? 0;
+    document.getElementById('tigertag-bed-max').value = normalized.bedMax ?? 0;
+    document.getElementById('tigertag-dry-temp').value = normalized.dryTemp ?? 0;
+    document.getElementById('tigertag-dry-time').value = normalized.dryTime ?? 0;
+    document.getElementById('tigertag-manufacturing-date').value =
+        String(normalized.manufacturingDate || '').slice(0, 10);
+    document.getElementById('tigertag-td').value = normalized.tdMm ?? 0;
+    document.getElementById('tigertag-message').value = normalized.message || '';
+
+    const inventoryName = String(normalized.inventoryName ||
+        tigerTagAuthoringContext.spool?.filament?.name || '').trim();
+    const inventoryElement = document.getElementById('tigertag-inventory-name');
+    inventoryElement.style.display = inventoryName ? '' : 'none';
+    inventoryElement.textContent = inventoryName
+        ? `Spoolman inventory name: ${inventoryName}. It is not copied to the on-tag message automatically.`
+        : '';
+    document.getElementById('tigertag-form').style.display = '';
+    document.getElementById('tigertag-preview').style.display = 'none';
+    document.getElementById('tigertag-validation').textContent = '';
+    updateTigerTagColorActivity();
+    setTigerTagMessageByteCount();
+    updateTigerTagAuthoringGate();
+}
+
+function collectTigerTagDraft() {
+    const base = tigerTagAuthoringContext?.draft || {};
+    const manufacturingDate = document.getElementById('tigertag-manufacturing-date').value;
+    const draft = {
+        ...base,
+        productType: document.getElementById('tigertag-product-type').value,
+        material: document.getElementById('tigertag-material').value,
+        brand: document.getElementById('tigertag-brand').value,
+        aspect1: document.getElementById('tigertag-aspect-1').value,
+        aspect2: document.getElementById('tigertag-aspect-2').value,
+        diameter: document.getElementById('tigertag-diameter').value,
+        storedColors: [1, 2, 3].map(index =>
+            document.getElementById(`tigertag-color-${index}`).value.replace(/^#/, '').toUpperCase()),
+        primaryColorAlpha: document.getElementById('tigertag-color-alpha').value,
+        measure: document.getElementById('tigertag-measure').value,
+        measureAvailable: document.getElementById('tigertag-measure-available').value,
+        unit: document.getElementById('tigertag-unit').value,
+        nozzleMin: document.getElementById('tigertag-nozzle-min').value,
+        nozzleMax: document.getElementById('tigertag-nozzle-max').value,
+        bedMin: document.getElementById('tigertag-bed-min').value,
+        bedMax: document.getElementById('tigertag-bed-max').value,
+        dryTemp: document.getElementById('tigertag-dry-temp').value,
+        dryTime: document.getElementById('tigertag-dry-time').value,
+        manufacturingDate,
+        tdMm: document.getElementById('tigertag-td').value,
+        message: document.getElementById('tigertag-message').value,
+    };
+    draft.colors = draft.storedColors.slice(0, tigerTagColorCount());
+    if (manufacturingDate !== String(base.manufacturingDate || '').slice(0, 10)) {
+        delete draft.timestamp;
+    }
+    return draft;
+}
+
+function currentTigerTagAuthoringChannel(context = tigerTagAuthoringContext) {
+    if (!context) return null;
+    const channel = channelsData.find(item => item.channel === context.channel);
+    if (!channel) return null;
+    if (openRfidSlotGenerations[context.channel] !== context.generation) return null;
+    if (TigerTagAuthoring.normalizeUid(channel.physical?.uidHex) !== context.uid) return null;
+    return channel;
+}
+
+function setTigerTagAuthoringMessage(message, kind = '') {
+    const element = document.getElementById('tigertag-validation');
+    element.textContent = message || '';
+    element.className = 'spoolman-fields-message' + (kind ? ` ${kind}` : '');
+}
+
+function tigerTagInitializationOverride() {
+    return document.getElementById('tigertag-allow-unrecognized').checked;
+}
+
+function tigerTagLegacyMigrationOverride() {
+    return document.getElementById('tigertag-allow-legacy').checked;
+}
+
+function updateTigerTagAuthoringGate() {
+    if (!tigerTagAuthoringContext) return;
+    const channel = currentTigerTagAuthoringChannel();
+    const format = channel?.tag_format || 'unknown';
+    const initializeRow = document.getElementById('tigertag-initialize-row');
+    const legacyRow = document.getElementById('tigertag-legacy-row');
+    const needsInitialization = format !== 'tigertag';
+    const needsLegacyMigration = TigerTagAuthoring.migratableLegacyTag(channel);
+    initializeRow.style.display = needsInitialization ? '' : 'none';
+    if (!needsInitialization) document.getElementById('tigertag-allow-unrecognized').checked = false;
+    legacyRow.style.display = needsLegacyMigration ? '' : 'none';
+    if (!needsLegacyMigration) document.getElementById('tigertag-allow-legacy').checked = false;
+    document.getElementById('tigertag-allow-unrecognized').disabled =
+        tigerTagAuthoringBusy || openRfidApi?.allow_unrecognized_write !== true;
+    document.getElementById('tigertag-allow-legacy').disabled =
+        tigerTagAuthoringBusy || openRfidApi?.allow_legacy_migration_write !== true;
+
+    const gate = TigerTagAuthoring.authoringGate(
+        openRfidApi,
+        channel,
+        tigerTagInitializationOverride(),
+        tigerTagLegacyMigrationOverride()
+    );
+    const globalCapabilities = openRfidApi?.capabilities || {};
+    if (globalCapabilities.tigertag_options !== true) gate.reasons.push('TigerTag registry options are unavailable');
+    if (globalCapabilities.tigertag_encode !== true) gate.reasons.push('TigerTag encoding is unavailable');
+    if (globalCapabilities.expected_uid_required !== true
+            || globalCapabilities.expected_format !== 'tigertag'
+            || globalCapabilities.print_state_guard !== true) {
+        gate.reasons.push('OpenRFID does not advertise the required UID, format, and print-state guards');
+    }
+    const uncertain = tigerTagUncertainOperations.get(tigerTagAuthoringContext.channel);
+    if (uncertain) {
+        gate.reasons.push(`Operation ${uncertain.operationId} has an uncertain outcome; do not retry until its status and a fresh scan are verified`);
+    }
+    gate.ok = gate.reasons.length === 0;
+
+    const gateElement = document.getElementById('tigertag-gate');
+    gateElement.className = `spoolman-picker-warning${gate.ok ? '' : ' conflict'}`;
+    gateElement.textContent = gate.ok
+        ? `Ready for guarded Maker writes to UID ${gate.uid}; printer state: ${openRfidApi?.print_state || 'unknown'}.`
+        : gate.reasons.join(' ');
+    const canClear = gate.ok && globalCapabilities.tigertag_clear === true;
+    document.getElementById('tigertag-clear').disabled = tigerTagAuthoringBusy || !canClear;
+    document.getElementById('tigertag-confirm-write').disabled =
+        tigerTagAuthoringBusy || !gate.ok || !tigerTagAuthoringPreview;
+    document.getElementById('tigertag-review').disabled = tigerTagAuthoringBusy ||
+        !gate.ok || globalCapabilities.tigertag_encode !== true;
+    return gate;
+}
+
+function setTigerTagOperationMessage(message, kind = '') {
+    const element = document.getElementById('tigertag-operation-status');
+    element.textContent = message || '';
+    element.className = 'spoolman-fields-message' + (kind ? ' ' + kind : '');
+}
+
+function updateTigerTagSourceButtons() {
+    const context = tigerTagAuthoringContext;
+    const channel = currentTigerTagAuthoringChannel(context);
+    document.getElementById('tigertag-source-tag').disabled = tigerTagAuthoringBusy ||
+        !channel?.decoded || channel.tag_format !== 'tigertag';
+    document.getElementById('tigertag-source-spool').disabled = tigerTagAuthoringBusy ||
+        !context?.spool;
+}
+
+function setTigerTagAuthoringBusy(busy) {
+    tigerTagAuthoringBusy = busy === true;
+    document.querySelectorAll('#tigertag-form fieldset input, #tigertag-form fieldset select, #tigertag-form fieldset textarea')
+        .forEach(element => { element.disabled = tigerTagAuthoringBusy; });
+    document.getElementById('tigertag-close').disabled = tigerTagAuthoringBusy;
+    document.getElementById('tigertag-cancel').disabled = tigerTagAuthoringBusy;
+    document.getElementById('tigertag-preview-back').disabled = tigerTagAuthoringBusy;
+    updateTigerTagSourceButtons();
+    updateTigerTagAuthoringGate();
+}
+
+function closeTigerTagEditor() {
+    if (tigerTagAuthoringBusy) return;
+    tigerTagAuthoringContext = null;
+    tigerTagAuthoringPreview = null;
+    closeModal('tigertag-modal');
+}
+
+async function openTigerTagEditor(channelNumber) {
+    const channel = channelsData.find(item => item.channel === channelNumber);
+    const uid = TigerTagAuthoring.normalizeUid(channel?.physical?.uidHex);
+    if (!channel || !uid || channel.physical?.hardwareType !== 'ultralight') {
+        showStatus('TigerTag writing requires a present Ultralight / NTAG with a 7-byte UID', 'error');
+        return;
+    }
+
+    const context = {
+        channel: channelNumber,
+        uid,
+        generation: openRfidSlotGenerations[channelNumber],
+        spoolId: channel.spool_id,
+        spool: channel.spool_id != null ? spoolmanSpools.get(channel.spool_id) || null : null,
+        draft: null,
+        source: '',
+    };
+    tigerTagAuthoringContext = context;
+    tigerTagAuthoringPreview = null;
+    document.getElementById('tigertag-title').textContent =
+        'TigerTag Editor - Extruder ' + (channelNumber + 1);
+    document.getElementById('tigertag-allow-unrecognized').checked = false;
+    document.getElementById('tigertag-allow-legacy').checked = false;
+    document.getElementById('tigertag-form').style.display = 'none';
+    document.getElementById('tigertag-preview').style.display = 'none';
+    document.getElementById('tigertag-inventory-name').style.display = 'none';
+    document.getElementById('tigertag-sdk').textContent = 'Loading pinned TigerTag registry...';
+    setTigerTagAuthoringMessage('Checking server and reader capabilities...', '');
+    setTigerTagOperationMessage('');
+    openModal('tigertag-modal');
+    setTigerTagAuthoringBusy(true);
+
+    try {
+        const spoolPromise = context.spoolId != null && spoolmanActive
+            ? fetchSpoolmanSpool(context.spoolId).then(spool => spool || context.spool)
+            : Promise.resolve(context.spool);
+        const [api, _options, spool] = await Promise.all([
+            loadOpenRfidChannels(),
+            loadTigerTagOptions(),
+            spoolPromise,
+        ]);
+        if (tigerTagAuthoringContext !== context) return;
+        if (!api) throw new Error('OpenRFID authoring API is unavailable');
+        const current = currentTigerTagAuthoringChannel(context);
+        if (!current) throw new Error('The tag changed while the editor was loading');
+
+        context.spool = spool || null;
+        if (context.spool?.id != null) spoolmanSpools.set(context.spool.id, context.spool);
+        populateTigerTagRegistryControls();
+
+        if (current.tag_format === 'tigertag' && current.decoded) {
+            applyTigerTagDraft(
+                TigerTagAuthoring.draftFromTag(current),
+                'Current ' + (current.decoded.formatData?.variant || 'TigerTag') + ' payload'
+            );
+        } else if (context.spool) {
+            applyTigerTagDraft(
+                TigerTagAuthoring.draftFromSpool(context.spool, false),
+                'Assigned Spoolman spool #' + context.spool.id
+            );
+        } else {
+            applyTigerTagDraft(defaultTigerTagDraft(), 'New TigerTag Maker draft');
+        }
+    } catch (error) {
+        if (tigerTagAuthoringContext === context) {
+            document.getElementById('tigertag-form').style.display = 'none';
+            setTigerTagAuthoringMessage('Editor unavailable: ' + openRfidResultError(error, error.message), 'error');
+        }
+    } finally {
+        if (tigerTagAuthoringContext === context) setTigerTagAuthoringBusy(false);
+    }
+}
+
+function loadTigerTagSourceFromTag() {
+    const channel = currentTigerTagAuthoringChannel();
+    if (!channel?.decoded || channel.tag_format !== 'tigertag') {
+        setTigerTagAuthoringMessage('The current tag no longer has a decodable TigerTag payload', 'error');
+        return;
+    }
+    document.getElementById('tigertag-allow-unrecognized').checked = false;
+    applyTigerTagDraft(
+        TigerTagAuthoring.draftFromTag(channel),
+        'Current ' + (channel.decoded.formatData?.variant || 'TigerTag') + ' payload'
+    );
+}
+
+function loadTigerTagSourceFromSpool() {
+    const context = tigerTagAuthoringContext;
+    if (!context?.spool) {
+        setTigerTagAuthoringMessage('No assigned Spoolman spool is available', 'error');
+        return;
+    }
+    applyTigerTagDraft(
+        TigerTagAuthoring.draftFromSpool(context.spool, false),
+        'Assigned Spoolman spool #' + context.spool.id
+    );
+}
+
+function renderTigerTagWritePreview(preview) {
+    const encoded = preview.encoded;
+    const spec = preview.spec;
+    const content = document.getElementById('tigertag-preview-content');
+    content.innerHTML = '';
+    const rows = [
+        { label: 'Source', value: preview.source },
+        { label: 'Product type', value: tigerTagOptionLabel('types', spec.type) },
+        { label: 'Material', value: tigerTagOptionLabel('materials', spec.material) },
+        { label: 'Brand', value: tigerTagOptionLabel('brands', spec.brand) },
+        { label: 'Primary aspect', value: tigerTagOptionLabel('aspects', spec.aspect_1) },
+        { label: 'Secondary aspect', value: tigerTagOptionLabel('aspects', spec.aspect_2) },
+        { label: 'Diameter', value: tigerTagOptionLabel('diameters', spec.diameter) + ' mm' },
+        { label: 'Stored colors', value: spec.colors.join(', ') },
+        { label: 'Initial / available', value: spec.measure + ' / ' + spec.measure_available + ' ' + tigerTagOptionLabel('units', spec.unit) },
+        { label: 'Nozzle', value: spec.temp_min_c + '-' + spec.temp_max_c + ' C' },
+        { label: 'Bed', value: spec.bed_temp_min_c + '-' + spec.bed_temp_max_c + ' C' },
+        { label: 'Drying', value: spec.dry_temp_c + ' C for ' + spec.dry_time_h + ' h' },
+        { label: spec.timestamp != null ? 'Raw timestamp' : 'Manufacturing date', value: spec.timestamp != null ? String(spec.timestamp) : String(spec.manufacturing_date || '(not set)') },
+        { label: 'Transmission distance', value: spec.td_mm === 0 ? 'Unknown (0)' : spec.td_mm + ' mm' },
+        { label: 'Tag message', value: spec.message || '(empty)' },
+    ];
+    appendDetailsSection(content, 'Encoded TigerTag Maker fields', rows);
+    if (preview.validation.inventoryName) {
+        appendDetailsSection(content, 'Not written to the tag', [{
+            label: 'Spoolman inventory name',
+            value: preview.validation.inventoryName,
+        }]);
+    }
+
+    const uidDisplay = preview.uid.match(/.{2}/g).join(':');
+    document.getElementById('tigertag-preview-target').textContent =
+        'Extruder ' + (preview.channel + 1) + ', UID ' + uidDisplay
+        + ': overwrite pages ' + encoded.start_page + '-' + encoded.end_page
+        + ' (' + encoded.bytes + ' bytes).';
+    const hex = encoded.data_hex.toUpperCase();
+    const pageLines = [];
+    for (let page = 0; page < encoded.pages; page++) {
+        pageLines.push(
+            String(encoded.start_page + page).padStart(2, '0') + ': '
+            + hex.slice(page * 8, page * 8 + 8)
+        );
+    }
+    document.getElementById('tigertag-preview-hex').textContent = pageLines.join('\n');
+    document.getElementById('tigertag-form').style.display = 'none';
+    document.getElementById('tigertag-preview').style.display = '';
+    setTigerTagOperationMessage('Review the target UID and every field before confirming.');
+    updateTigerTagAuthoringGate();
+}
+
+async function reviewTigerTagWrite(event) {
+    event?.preventDefault();
+    const context = tigerTagAuthoringContext;
+    if (!context || !currentTigerTagAuthoringChannel(context)) {
+        setTigerTagAuthoringMessage('The tag changed; close the editor and scan again', 'error');
+        return;
+    }
+    const gate = updateTigerTagAuthoringGate();
+    if (!gate?.ok) {
+        setTigerTagAuthoringMessage('Writing is blocked: ' + gate.reasons.join(' '), 'error');
+        return;
+    }
+
+    const draft = collectTigerTagDraft();
+    const validation = TigerTagAuthoring.validateDraft(draft, tigerTagOptions);
+    context.draft = draft;
+    if (!validation.ok) {
+        tigerTagAuthoringPreview = null;
+        setTigerTagAuthoringMessage(validation.errors.join(' '), 'error');
+        return;
+    }
+
+    setTigerTagAuthoringBusy(true);
+    setTigerTagAuthoringMessage('Encoding with the pinned TigerTag SDK...', '');
+    try {
+        const encoded = requireOpenRfidResult(
+            await openRfidRequest('openrfid/tigertag_encode', { spec: validation.spec }),
+            'TigerTag encoding failed'
+        );
+        if (tigerTagAuthoringContext !== context || !currentTigerTagAuthoringChannel(context)) {
+            throw new Error('The target tag changed during encoding');
+        }
+        if (encoded.tag_format !== 'tigertag' || encoded.tag_variant !== 'maker'
+                || encoded.start_page !== 4 || encoded.end_page !== 23
+                || encoded.bytes !== 80 || encoded.pages !== 20
+                || !/^[0-9a-f]{160}$/i.test(encoded.data_hex || '')) {
+            throw new Error('OpenRFID returned an invalid TigerTag Maker preview');
+        }
+        tigerTagAuthoringPreview = {
+            context,
+            channel: context.channel,
+            uid: context.uid,
+            generation: context.generation,
+            source: context.source,
+            validation,
+            spec: validation.spec,
+            encoded,
+            allowUnrecognized: tigerTagInitializationOverride(),
+            allowLegacyMigration: tigerTagLegacyMigrationOverride(),
+        };
+        setTigerTagAuthoringMessage('');
+        renderTigerTagWritePreview(tigerTagAuthoringPreview);
+    } catch (error) {
+        tigerTagAuthoringPreview = null;
+        setTigerTagAuthoringMessage('Preview failed: ' + openRfidResultError(error, error.message), 'error');
+    } finally {
+        if (tigerTagAuthoringContext === context) setTigerTagAuthoringBusy(false);
+    }
+}
+
+function backToTigerTagEditor() {
+    if (tigerTagAuthoringBusy) return;
+    tigerTagAuthoringPreview = null;
+    document.getElementById('tigertag-preview').style.display = 'none';
+    document.getElementById('tigertag-form').style.display = '';
+    setTigerTagAuthoringMessage('Fields changed after this point require a new server preview.');
+    updateTigerTagAuthoringGate();
+}
+
+function waitForTigerTagEvent(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function resolveTigerTagOperation(initialResult, context, action) {
+    if (initialResult?.ok === true) return initialResult;
+    if (initialResult?.code !== 'timeout_in_progress') {
+        return requireOpenRfidResult(initialResult, 'TigerTag ' + action + ' failed');
+    }
+    const operationId = String(initialResult.operation_id || '');
+    if (!/^[0-9a-f]{32}$/i.test(operationId)) {
+        throw new Error('Timed-out operation did not return a valid operation ID; do not retry');
+    }
+
+    tigerTagUncertainOperations.set(context.channel, {
+        operationId,
+        action,
+        uid: context.uid,
+    });
+    setTigerTagOperationMessage(
+        'Operation ' + operationId + ' is still running. Polling its status; it will not be retried.',
+        ''
+    );
+    updateTigerTagAuthoringGate();
+
+    const deadline = Date.now() + 60000;
+    while (Date.now() < deadline) {
+        if (tigerTagAuthoringContext !== context || !currentTigerTagAuthoringChannel(context)) {
+            throw new Error('Target changed while operation ' + operationId + ' was running; do not retry');
+        }
+        let status;
+        try {
+            status = await openRfidRequest('openrfid/operation_status', {
+                operation_id: operationId,
+            });
+        } catch (error) {
+            throw new Error(
+                'Could not query operation ' + operationId + ': '
+                + openRfidResultError(error, error.message) + '. Do not retry until it is verified.'
+            );
+        }
+        if (!status?.ok) {
+            throw new Error(
+                openRfidResultError(status, 'Operation status unavailable')
+                + '. Operation ' + operationId + ' must not be retried.'
+            );
+        }
+        if (status.operation_id !== operationId) {
+            throw new Error('OpenRFID returned status for a different operation; do not retry');
+        }
+        if (status.completed === true) {
+            if (!status.result || typeof status.result !== 'object') {
+                throw new Error('Operation ' + operationId + ' completed without a terminal result');
+            }
+            if (status.result.ok !== true) {
+                tigerTagUncertainOperations.delete(context.channel);
+            }
+            return status.result;
+        }
+        if (status.operation_state !== 'queued' && status.operation_state !== 'running') {
+            throw new Error('Operation ' + operationId + ' has unknown state ' + status.operation_state);
+        }
+        setTigerTagOperationMessage(
+            'Operation ' + operationId + ' is ' + status.operation_state
+            + '; waiting without retrying...'
+        );
+        await waitForTigerTagEvent(500);
+    }
+    throw new Error(
+        'Operation ' + operationId
+        + ' is still unresolved. Do not retry until its status and a fresh scan are verified.'
+    );
+}
+
+function requireVerifiedTigerTagMutation(result, context, action) {
+    requireOpenRfidResult(result, 'TigerTag ' + action + ' failed');
+    const expectedCode = action === 'write' ? 'written' : 'cleared';
+    if (result.code !== expectedCode || result.verified !== true
+            || result.start_page !== 4 || result.end_page !== 23
+            || result.bytes_written !== 80) {
+        throw new Error('OpenRFID did not return a complete verified ' + action + ' result');
+    }
+    if (TigerTagAuthoring.normalizeUid(result.uid) !== context.uid) {
+        throw new Error('Physical ' + action + ' result belongs to a different UID');
+    }
+    return result;
+}
+
+async function refreshTigerTagGate(context) {
+    const api = await loadOpenRfidChannels();
+    if (!api) throw new Error('OpenRFID authoring API is unavailable');
+    if (tigerTagAuthoringContext !== context || !currentTigerTagAuthoringChannel(context)) {
+        throw new Error('The target tag changed');
+    }
+    const gate = updateTigerTagAuthoringGate();
+    if (!gate?.ok) throw new Error(gate?.reasons?.join(' ') || 'TigerTag writing is blocked');
+    return gate;
+}
+
+async function forceTigerTagRescanAndVerify(context, spec, action) {
+    const slot = context.channel;
+    invalidateOpenRfidSlot(slot);
+    context.generation = openRfidSlotGenerations[slot];
+    rebuildFromCache();
+    const generation = context.generation;
+    requireOpenRfidResult(
+        await openRfidRequest('openrfid/scan_slot', { slot }),
+        'Could not start the mandatory verification scan'
+    );
+
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+        if (openRfidSlotGenerations[slot] !== generation) {
+            throw new Error('Tag presence changed during the verification scan');
+        }
+        const channel = currentTigerTagAuthoringChannel(context);
+        if (!channel) throw new Error('The expected UID is no longer present');
+        const scan = openRfidScans.get(slot);
+        if (scan?._presenceGeneration === generation) {
+            if (TigerTagAuthoring.normalizeUid(scan.uid) !== context.uid) {
+                throw new Error('Verification scan returned a different UID');
+            }
+            if (action === 'clear') {
+                if (scan.event === 'tag_parse_error' && !channel.decoded) {
+                    return { channel, generation };
+                }
+                if (scan.event === 'tag_read') {
+                    throw new Error('Cleared tag still contains a decodable payload');
+                }
+            } else {
+                if (scan.event === 'tag_parse_error') {
+                    throw new Error('Written TigerTag could not be decoded on the fresh scan');
+                }
+                if (scan.event === 'tag_read' && channel.decoded) {
+                    const verification = TigerTagAuthoring.verifyRescan(channel, spec);
+                    if (!verification.ok) {
+                        throw new Error('Fresh readback mismatch: ' + verification.errors.join(', '));
+                    }
+                    return { channel, generation };
+                }
+            }
+        }
+        await waitForTigerTagEvent(250);
+    }
+    throw new Error('Timed out waiting for a fresh same-UID verification scan');
+}
+
+async function confirmTigerTagWrite() {
+    const context = tigerTagAuthoringContext;
+    const preview = tigerTagAuthoringPreview;
+    if (!context || !preview || preview.context !== context
+            || preview.uid !== context.uid || preview.generation !== context.generation) {
+        setTigerTagOperationMessage('Preview is stale; return to the editor and encode it again.', 'error');
+        return;
+    }
+
+    setTigerTagAuthoringBusy(true);
+    try {
+        await refreshTigerTagGate(context);
+        if (preview.allowUnrecognized !== tigerTagInitializationOverride()
+                || preview.allowLegacyMigration !== tigerTagLegacyMigrationOverride()) {
+            throw new Error('Safety confirmation changed after preview; encode a new preview');
+        }
+        const mode = preview.allowLegacyMigration
+            ? 'MIGRATE legacy_openrfid_v1 to Maker'
+            : preview.allowUnrecognized
+                ? 'INITIALIZE an unrecognized NTAG as Maker'
+                : 'WRITE TigerTag Maker';
+        const confirmed = window.confirm(
+            mode + '\n\nExtruder ' + (context.channel + 1)
+            + '\nUID ' + context.uid.match(/.{2}/g).join(':')
+            + '\nPages 4-23, 80 bytes\n\n'
+            + 'The operation will be accepted only for this UID and success requires a fresh readback.'
+        );
+        if (!confirmed) return;
+
+        setTigerTagOperationMessage('Writing pages 4-23 and verifying physical readback...');
+        const request = TigerTagAuthoring.writePayloadRequest(
+            context.channel,
+            context.uid,
+            preview.encoded.data_hex,
+            preview.allowUnrecognized,
+            preview.allowLegacyMigration
+        );
+        request.timeout = 20;
+        let result = await openRfidRequest('openrfid/write_tag', request);
+        result = await resolveTigerTagOperation(result, context, 'write');
+        if (result?.ok === true) {
+            tigerTagUncertainOperations.set(context.channel, {
+                operationId: String(result.operation_id || 'completed-write'),
+                action: 'write',
+                uid: context.uid,
+            });
+        }
+        requireVerifiedTigerTagMutation(result, context, 'write');
+        await forceTigerTagRescanAndVerify(context, preview.spec, 'write');
+        tigerTagUncertainOperations.delete(context.channel);
+        tigerTagAuthoringPreview = null;
+        setTigerTagOperationMessage(
+            'Write completed and every field was verified by a fresh same-UID scan.',
+            'success'
+        );
+        showStatus('TigerTag written and verified on extruder ' + (context.channel + 1), 'success');
+        updateTigerTagSourceButtons();
+        updateTigerTagAuthoringGate();
+    } catch (error) {
+        setTigerTagOperationMessage(
+            'Write not confirmed: ' + openRfidResultError(error, error.message),
+            'error'
+        );
+        showStatus('TigerTag write was not verified', 'error');
+    } finally {
+        if (tigerTagAuthoringContext === context) setTigerTagAuthoringBusy(false);
+    }
+}
+
+async function clearTigerTag() {
+    const context = tigerTagAuthoringContext;
+    if (!context || !currentTigerTagAuthoringChannel(context)) {
+        setTigerTagAuthoringMessage('The target tag changed', 'error');
+        return;
+    }
+    setTigerTagAuthoringBusy(true);
+    try {
+        await refreshTigerTagGate(context);
+        const allowUnrecognized = tigerTagInitializationOverride();
+        const allowLegacyMigration = tigerTagLegacyMigrationOverride();
+        const mode = allowLegacyMigration
+            ? 'CLEAR the exact legacy_openrfid_v1 payload'
+            : allowUnrecognized
+                ? 'CLEAR this unrecognized NTAG payload'
+                : 'CLEAR this TigerTag Maker payload';
+        const confirmed = window.confirm(
+            mode + '\n\nExtruder ' + (context.channel + 1)
+            + '\nUID ' + context.uid.match(/.{2}/g).join(':')
+            + '\nPages 4-23 will be zeroed. Other pages are untouched.\n\n'
+            + 'Success requires a fresh same-UID tag_parse_error readback.'
+        );
+        if (!confirmed) return;
+
+        setTigerTagAuthoringMessage('Clearing pages 4-23 and verifying...', '');
+        const request = TigerTagAuthoring.clearRequest(
+            context.channel,
+            context.uid,
+            allowUnrecognized,
+            allowLegacyMigration
+        );
+        request.timeout = 20;
+        let result = await openRfidRequest('openrfid/clear_tag', request);
+        result = await resolveTigerTagOperation(result, context, 'clear');
+        if (result?.ok === true) {
+            tigerTagUncertainOperations.set(context.channel, {
+                operationId: String(result.operation_id || 'completed-clear'),
+                action: 'clear',
+                uid: context.uid,
+            });
+        }
+        requireVerifiedTigerTagMutation(result, context, 'clear');
+        await forceTigerTagRescanAndVerify(context, null, 'clear');
+        tigerTagUncertainOperations.delete(context.channel);
+        tigerTagAuthoringPreview = null;
+        setTigerTagAuthoringMessage(
+            'Clear completed and a fresh scan confirmed the same UID has no decodable payload.',
+            'success'
+        );
+        showStatus('TigerTag data cleared and verified on extruder ' + (context.channel + 1), 'success');
+        updateTigerTagSourceButtons();
+        updateTigerTagAuthoringGate();
+    } catch (error) {
+        setTigerTagAuthoringMessage(
+            'Clear not confirmed: ' + openRfidResultError(error, error.message),
+            'error'
+        );
+        showStatus('TigerTag clear was not verified', 'error');
+    } finally {
+        if (tigerTagAuthoringContext === context) setTigerTagAuthoringBusy(false);
+    }
 }
 
 async function refreshSpoolWeights() {
@@ -207,7 +1591,26 @@ function scheduleSpoolRefresh() {
 }
 
 function mergeStatus(status) {
-    if (status.filament_detect)   Object.assign(cachedStatus.filament_detect,   status.filament_detect);
+    if (status.filament_detect) {
+        const beforeInfo = cachedStatus.filament_detect.info || [{}, {}, {}, {}];
+        const beforeState = cachedStatus.filament_detect.state || [0, 0, 0, 0];
+        const beforeUids = [0, 1, 2, 3].map(slot =>
+            RfidPort.normalizeUid(beforeInfo[slot]?.CARD_UID));
+        const beforeStates = [0, 1, 2, 3].map(slot => beforeState[slot]);
+
+        Object.assign(cachedStatus.filament_detect, status.filament_detect);
+
+        const afterInfo = cachedStatus.filament_detect.info || [{}, {}, {}, {}];
+        const afterState = cachedStatus.filament_detect.state || [0, 0, 0, 0];
+        for (let slot = 0; slot < 4; slot++) {
+            const afterUid = RfidPort.normalizeUid(afterInfo[slot]?.CARD_UID);
+            const detectingStarted = afterState[slot] === FD_STATE_DETECTING
+                && beforeStates[slot] !== FD_STATE_DETECTING;
+            if (beforeUids[slot] !== afterUid || detectingStarted) {
+                invalidateOpenRfidSlot(slot);
+            }
+        }
+    }
     if (status.print_task_config) Object.assign(cachedStatus.print_task_config, status.print_task_config);
 }
 
@@ -235,6 +1638,7 @@ async function refreshAllChannels() {
     if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Reading…'; }
 
     try {
+        for (let i = 0; i < 4; i++) invalidateOpenRfidSlot(i);
         const gcodes = [];
         for (let i = 0; i < 4; i++) gcodes.push(`FILAMENT_DT_CLEAR CHANNEL=${i}`);
         for (let i = 0; i < 4; i++) gcodes.push(`FILAMENT_DT_UPDATE CHANNEL=${i}`);
@@ -250,6 +1654,7 @@ async function refreshAllChannels() {
 async function refreshSingleChannel(channel) {
     if (!wsReady) { showStatus('Waiting for connection…', 'info'); return; }
     try {
+        invalidateOpenRfidSlot(channel);
         await sendGcode(`FILAMENT_DT_CLEAR CHANNEL=${channel}\nFILAMENT_DT_UPDATE CHANNEL=${channel}`);
     } catch (err) {
         showStatus(`Refresh failed: ${err.message}`, 'error');
@@ -266,6 +1671,20 @@ function parseChannelInfo(i, fd, fdState, ptc) {
     const tagStatus = fd.TAG_STATUS || null;
     const fdMainType = fd.MAIN_TYPE && fd.MAIN_TYPE !== 'NONE' ? fd.MAIN_TYPE : null;
     const present = fdState === FD_STATE_DETECTING || hasUid;
+    const uidHex = RfidPort.normalizeUid(uid);
+    const cachedOpenRfidScan = openRfidScans.get(i) || null;
+    const scanUid = RfidPort.normalizeUid(cachedOpenRfidScan?.uid);
+    const scanMatches = !!(uidHex && scanUid && uidHex === scanUid
+        && cachedOpenRfidScan?._presenceGeneration === openRfidSlotGenerations[i]
+        && cachedOpenRfidScan?.event !== 'tag_not_present');
+    const decoded = scanMatches && cachedOpenRfidScan?.filament
+        ? RfidPort.normalizeDecoded(cachedOpenRfidScan.filament, fd.TAG_FORMAT)
+        : null;
+    const tagFormat = decoded?.tagFormat || (hasUid ? (fd.TAG_FORMAT || null) : null);
+    const hardwareType = RfidPort.hardwareFrom(
+        scanMatches ? cachedOpenRfidScan?.tag_type : null,
+        cardType
+    );
 
     // official flag and existence from print_task_config
     const isOfficial = !!(ptc.filament_official && ptc.filament_official[i]);
@@ -350,6 +1769,22 @@ function parseChannelInfo(i, fd, fdState, ptc) {
         official: isOfficial,
         uid,
         card_type: cardType,
+        uid_hex: uidHex,
+        tag_format: tagFormat,
+        physical: {
+            state: decoded ? 'read' : (hasUid ? 'unrecognized' : 'not_present'),
+            uidHex,
+            hardwareType,
+            reader: scanMatches ? cachedOpenRfidScan?.reader || null : null,
+            scannedAt: scanMatches ? cachedOpenRfidScan?.ts || null : null,
+        },
+        decoded,
+        openRfidCapabilities: openRfidChannelCapabilities.get(i) || null,
+        capabilities: {
+            scan: openRfidAvailable,
+            write: openRfidAvailable && openRfidWriteEnabled,
+            clear: openRfidAvailable && openRfidWriteEnabled,
+        },
         spool_id: spoolId,
         rfid_data: rfidData,
         mismatch,
@@ -460,8 +1895,14 @@ function createChannelCard(channel) {
     // Slot 3: physical presence — RFID (tag read) or Detecting (in progress)
     if (hasUid) {
         const b = document.createElement('span');
-        b.className = 'tag-type-badge rfid';
-        b.textContent = 'RFID';
+        b.className = 'tag-type-badge format';
+        b.textContent = channel.tag_format
+            ? RfidPort.formatLabel(channel.tag_format)
+            : 'Unrecognized';
+        b.addEventListener('click', e => {
+            e.stopPropagation();
+            openTagDetails(channel.channel);
+        });
         if (channel.rfid_data) {
             b.addEventListener('mouseenter', () => {
                 const rfid = channel.rfid_data;
@@ -478,6 +1919,16 @@ function createChannelCard(channel) {
             b.addEventListener('mouseleave', hidePopover);
         }
         badgesDiv.appendChild(b);
+        if (channel.physical?.hardwareType) {
+            const hardwareBadge = document.createElement('span');
+            hardwareBadge.className = 'tag-type-badge hardware';
+            hardwareBadge.textContent = RfidPort.hardwareLabel(channel.physical.hardwareType);
+            hardwareBadge.addEventListener('click', e => {
+                e.stopPropagation();
+                openTagDetails(channel.channel);
+            });
+            badgesDiv.appendChild(hardwareBadge);
+        }
     } else if (present) {
         const b = document.createElement('span');
         b.className = 'tag-type-badge detecting';
@@ -588,14 +2039,199 @@ function createChannelCard(channel) {
 
     actions.appendChild(mkBtn('↻ Refresh', '', () => refreshSingleChannel(channel.channel)));
     actions.appendChild(mkBtn('✎ User', '', () => openOverwriteModal(channel.channel)));
+    if (hasUid) actions.appendChild(mkBtn('Details', '', () => openTagDetails(channel.channel)));
+    if (hasUid && openRfidAvailable) {
+        const authorButton = mkBtn('TigerTag', '', () => void openTigerTagEditor(channel.channel));
+        const writer = channel.openRfidCapabilities?.tigertag_write;
+        const globalCapabilities = openRfidApi?.capabilities || {};
+        const reasons = [];
+        if (channel.physical?.hardwareType !== 'ultralight') {
+            reasons.push('Only Ultralight / NTAG hardware is writable');
+        }
+        if (globalCapabilities.tigertag_options !== true
+                || globalCapabilities.tigertag_encode !== true
+                || globalCapabilities.tigertag_write !== true
+                || globalCapabilities.expected_uid_required !== true
+                || globalCapabilities.expected_format !== 'tigertag'
+                || globalCapabilities.print_state_guard !== true) {
+            reasons.push('TigerTag authoring is disabled by OpenRFID');
+        }
+        if (!writer || writer.supported !== true) {
+            reasons.push(writer?.error || 'This reader does not support guarded TigerTag writes');
+        }
+        if (openRfidApi?.write_allowed === false) {
+            reasons.push(openRfidApi.write_block?.error || 'The printer write gate is closed');
+        }
+        if (TigerTagAuthoring.protectedTigerTag(channel)) {
+            reasons.push('TigerTag+ is read-only');
+        }
+        if (TigerTagAuthoring.migratableLegacyTag(channel)
+                && (openRfidApi?.allow_legacy_migration_write !== true
+                    || writer?.allow_legacy_migration_supported !== true)) {
+            reasons.push('legacy_openrfid_v1 migration is disabled');
+        }
+        if (channel.tag_format !== 'tigertag'
+                && openRfidApi?.allow_unrecognized_write !== true) {
+            reasons.push('Blank/unrecognized NTAG initialization is disabled');
+        }
+        const uncertain = tigerTagUncertainOperations.get(channel.channel);
+        if (uncertain) reasons.push('Operation ' + uncertain.operationId + ' is unresolved');
+        authorButton.disabled = reasons.length > 0;
+        authorButton.title = reasons.join('. ');
+        actions.appendChild(authorButton);
+    }
     actions.appendChild(mkBtn('Reset', '', () => resetChannel(channel.channel)));
-    if (spoolmanActive) actions.appendChild(mkBtn('⊕ Spool', '', () => openSpoolPicker(channel.channel)));
+    if (spoolmanActive) {
+        actions.appendChild(mkBtn('⊕ Spool', '', () => openSpoolPicker(channel.channel)));
+        if (channel.spool_id != null && channel.decoded) {
+            actions.appendChild(mkBtn('Sync tag', '', () => openSpoolmanMetadataSync(channel.channel)));
+        }
+    }
 
     card.appendChild(actions);
     return card;
 }
 
 // ── Info popover ──────────────────────────────────────────────────────────
+
+const TAG_FIELD_LABELS = {
+    message: 'Tag message',
+    manufacturer: 'Manufacturer',
+    type: 'Material',
+    material_name: 'TigerTag SDK material label',
+    modifiers: 'Aspects / variant',
+    colors: 'Colors (ARGB)',
+    colors_rgba_hex: 'Colors (RGBA)',
+    diameter_mm: 'Diameter',
+    weight_grams: 'Initial quantity',
+    available_weight_grams: 'Available quantity',
+    hotend_min_temp_c: 'Nozzle minimum',
+    hotend_max_temp_c: 'Nozzle maximum',
+    bed_temp_min_c: 'Bed minimum',
+    bed_temp_c: 'Bed temperature / minimum',
+    bed_temp_max_c: 'Bed maximum',
+    drying_temp_c: 'Drying temperature',
+    drying_time_hours: 'Drying duration',
+    manufacturing_date: 'Manufacturing date',
+    td: 'Transmission distance',
+    td_mm: 'Transmission distance',
+    unique_id: 'Content ID',
+    source_processor: 'Processor',
+    rgb: 'Primary RGB',
+    alpha: 'Primary alpha',
+    rgba: 'Primary RGBA',
+    colors_rgba: 'Colors (RGBA integers)',
+};
+
+function humanizeTagField(key) {
+    if (TAG_FIELD_LABELS[key]) return TAG_FIELD_LABELS[key];
+    return String(key).replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function formatTagFieldValue(key, value) {
+    if (Array.isArray(value)) return value.length ? value.join(', ') : '[]';
+    if (value && typeof value === 'object') return JSON.stringify(value);
+    if (value === null) return 'null';
+    if (value === '') return '(empty)';
+    if (key === 'diameter_mm' || key === 'td' || key === 'td_mm') return `${value} mm`;
+    if (key.endsWith('_temp_c')) return `${value} °C`;
+    if (key === 'drying_time_hours') return `${value} h`;
+    if (key.endsWith('_grams')) return `${value} g`;
+    if (key === 'rgb') return `#${Number(value).toString(16).padStart(6, '0').toUpperCase()}`;
+    if (key === 'rgba') return `0x${Number(value).toString(16).padStart(8, '0').toUpperCase()}`;
+    return String(value);
+}
+
+function appendDetailsSection(container, title, rows) {
+    if (!rows.length) return;
+    const heading = document.createElement('h3');
+    heading.className = 'tag-details-section-title';
+    heading.textContent = title;
+    container.appendChild(heading);
+    const table = document.createElement('div');
+    table.className = 'tag-details-table';
+    for (const row of rows) {
+        const label = document.createElement('span');
+        label.className = 'tag-details-label';
+        label.textContent = row.label;
+        const value = document.createElement('span');
+        value.className = 'tag-details-value';
+        value.textContent = row.value;
+        table.append(label, value);
+    }
+    container.appendChild(table);
+}
+
+function openTagDetails(channelNumber) {
+    const channel = channelsData.find(item => item.channel === channelNumber);
+    if (!channel) return;
+    document.getElementById('tag-details-title').textContent =
+        `RFID Tag - Extruder ${channelNumber + 1}`;
+    const content = document.getElementById('tag-details-content');
+    content.innerHTML = '';
+
+    const physical = channel.physical || {};
+    const physicalRows = [
+        { label: 'Card UID', value: physical.uidHex || 'Unknown' },
+        { label: 'Hardware', value: RfidPort.hardwareLabel(physical.hardwareType) },
+        { label: 'Payload format', value: RfidPort.formatLabel(channel.tag_format) },
+    ];
+    if (physical.reader) physicalRows.push({ label: 'Reader', value: physical.reader });
+    if (physical.scannedAt) {
+        physicalRows.push({
+            label: 'Scanned',
+            value: new Date(Number(physical.scannedAt) * 1000).toLocaleString(),
+        });
+    }
+    appendDetailsSection(content, 'Physical tag', physicalRows);
+
+    const decoded = channel.decoded;
+    if (decoded) {
+        const fields = decoded.fields || {};
+        const present = Array.isArray(decoded.presentFields)
+            ? decoded.presentFields
+            : Object.keys(fields);
+        const seen = new Set();
+        const preferred = [
+            'message', 'manufacturer', 'type', 'material_name', 'modifiers', 'colors_rgba_hex',
+            'diameter_mm', 'weight_grams', 'available_weight_grams',
+            'hotend_min_temp_c', 'hotend_max_temp_c', 'bed_temp_min_c',
+            'bed_temp_c', 'bed_temp_max_c', 'drying_temp_c',
+            'drying_time_hours', 'manufacturing_date', 'td', 'td_mm',
+            'unique_id', 'source_processor',
+        ];
+        const orderedKeys = preferred.concat(present.filter(key => !preferred.includes(key)));
+        const decodedRows = [];
+        for (const key of orderedKeys) {
+            if (seen.has(key) || !present.includes(key) || !(key in fields)) continue;
+            seen.add(key);
+            decodedRows.push({
+                label: humanizeTagField(key),
+                value: formatTagFieldValue(key, fields[key]),
+            });
+        }
+        appendDetailsSection(content, 'Decoded payload', decodedRows);
+
+        const formatRows = Object.entries(decoded.formatData || {}).map(([key, value]) => ({
+            label: humanizeTagField(key),
+            value: formatTagFieldValue(key, value),
+        }));
+        appendDetailsSection(content, 'Format-specific data', formatRows);
+
+        const authRows = Object.entries(decoded.authentication || {}).map(([key, value]) => ({
+            label: humanizeTagField(key),
+            value: formatTagFieldValue(key, value),
+        }));
+        appendDetailsSection(content, 'Authentication', authRows);
+    } else {
+        const note = document.createElement('p');
+        note.className = 'tag-details-empty';
+        note.textContent = 'The tag is present, but OpenRFID did not decode a supported payload.';
+        content.appendChild(note);
+    }
+
+    openModal('tag-details-modal');
+}
 
 function showPopover(anchorEl, rows) {
     const popover = document.getElementById('info-popover');
@@ -671,66 +2307,146 @@ async function openSpoolPicker(channel) {
     spoolPickerSpools = spools;
     const ch = channelsData.find(c => c.channel === channel);
     spoolPickerCurrentId = ch ? ch.spool_id : null;
-    renderSpoolList('');
+    spoolPickerContext = RfidPort.buildTagMatchContext(
+        ch?.decoded,
+        ch?.physical?.uidHex
+    );
+    renderGroupedSpoolList('');
 }
 
-function renderSpoolList(filter) {
-    const list = document.getElementById('spoolman-list');
-    const lower = filter.toLowerCase();
-    const filtered = spoolPickerSpools.filter(s => {
-        if (s.is_archived) return false;
-        if (!lower) return true;
-        const name    = (s.filament.name     || '').toLowerCase();
-        const material= (s.filament.material || '').toLowerCase();
-        const vendor  = (s.filament.vendor?.name || '').toLowerCase();
-        return name.includes(lower) || material.includes(lower)
-            || vendor.includes(lower) || String(s.id).includes(lower);
-    });
+function createGroupedSpoolItem(spool, suggestion) {
+    const item = document.createElement('div');
+    item.className = 'spoolman-item' + (spool.id === spoolPickerCurrentId ? ' active' : '');
+    const filament = spool.filament || {};
+    const name = filament.name || filament.material || 'Unknown';
+    const vendor = filament.vendor?.name || '';
+    const material = filament.material || '';
+    const variant = RfidPort.decodeExtra(filament.extra?.variant);
+    const variantText = Array.isArray(variant) ? variant.join(', ') : (variant || '');
+    const meta = [vendor, material, variantText].filter(Boolean).join(' · ');
+    const weight = spool.remaining_weight != null ? `${Math.round(spool.remaining_weight)} g` : '—';
+    const rawColors = filament.multi_color_hexes
+        ? filament.multi_color_hexes.split(',').map(value => value.trim()).filter(Boolean)
+        : [filament.color_hex || 'CCCCCC'];
+    const colors = rawColors.map(value => String(value).replace(/^#/, ''))
+        .filter(value => /^[0-9A-F]{6}$/i.test(value));
+    const swatchesHtml = (colors.length ? colors : ['CCCCCC'])
+        .map(color => `<div class="spoolman-swatch" style="background:#${color.toUpperCase()}"></div>`)
+        .join('');
+    const reasons = suggestion?.reasons?.length
+        ? `<div class="spoolman-match-reasons">Matches: ${escHtml(suggestion.reasons.join(', '))}</div>`
+        : '';
+    item.innerHTML =
+        `<div class="spoolman-swatches">${swatchesHtml}</div>` +
+        '<div class="spoolman-info">' +
+            `<div class="spoolman-name">${escHtml(name)}</div>` +
+            `<div class="spoolman-meta">${escHtml(meta)}</div>` +
+            reasons +
+        '</div>' +
+        '<div class="spoolman-right">' +
+            `<div class="spoolman-weight">${escHtml(weight)}</div>` +
+            `<div class="spoolman-id">#${escHtml(spool.id)}</div>` +
+        '</div>';
+    item.addEventListener('click', () => pickSpool(spool.id));
+    return item;
+}
 
-    if (filtered.length === 0) {
-        list.innerHTML = '<div class="spoolman-empty">No spools found</div>';
-        return;
+function appendSpoolPickerGroup(list, title, rows, suggestions = false) {
+    if (!rows.length) return;
+    const heading = document.createElement('div');
+    heading.className = 'spoolman-group-heading';
+    heading.textContent = `${title} (${rows.length})`;
+    list.appendChild(heading);
+    for (const row of rows) {
+        const spool = suggestions ? row.spool : row;
+        list.appendChild(createGroupedSpoolItem(spool, suggestions ? row : null));
+    }
+}
+
+function renderGroupedSpoolList(filter) {
+    const list = document.getElementById('spoolman-list');
+    const grouped = RfidPort.groupSpools(
+        spoolPickerSpools,
+        spoolPickerContext,
+        spoolPickerCurrentId,
+        filter
+    );
+    list.innerHTML = '';
+
+    if (grouped.conflicts.length) {
+        const conflict = document.createElement('div');
+        conflict.className = 'spoolman-picker-warning conflict';
+        conflict.textContent = `Conflict: UID ${grouped.conflicts[0].uid} is linked to multiple spools (${grouped.conflicts[0].spoolIds.join(', ')}). Select explicitly.`;
+        list.appendChild(conflict);
+    }
+    if (grouped.legacy.length && !grouped.linked.length) {
+        const legacy = document.createElement('div');
+        legacy.className = 'spoolman-picker-warning';
+        legacy.textContent = `Legacy rfid_uid match found on spool(s) ${grouped.legacy.map(spool => `#${spool.id}`).join(', ')}. Assign one explicitly to migrate through SpoolLink.`;
+        list.appendChild(legacy);
     }
 
-    list.innerHTML = '';
-    filtered.forEach(s => {
-        const item = document.createElement('div');
-        item.className = 'spoolman-item' + (s.id === spoolPickerCurrentId ? ' active' : '');
-        const name     = s.filament.name || s.filament.material || 'Unknown';
-        const vendor   = s.filament.vendor?.name || '';
-        const material = s.filament.material || '';
-        const meta     = [vendor, material].filter(Boolean).join(' · ');
-        const weight   = s.remaining_weight != null ? `${Math.round(s.remaining_weight)} g` : '—';
-        const multiHexes = s.filament.multi_color_hexes
-            ? s.filament.multi_color_hexes.split(',').map(c => c.trim()).filter(Boolean)
-            : null;
-        const swatchColors = (multiHexes && multiHexes.length > 0) ? multiHexes : [s.filament.color_hex || 'CCCCCC'];
-        const swatchesHtml = swatchColors
-            .map(c => `<div class="spoolman-swatch" style="background:#${escHtml(c)}"></div>`)
-            .join('');
-        item.innerHTML =
-            `<div class="spoolman-swatches">${swatchesHtml}</div>` +
-            `<div class="spoolman-info">` +
-                `<div class="spoolman-name">${escHtml(name)}</div>` +
-                `<div class="spoolman-meta">${escHtml(meta)}</div>` +
-            `</div>` +
-            `<div class="spoolman-right">` +
-                `<div class="spoolman-weight">${escHtml(weight)}</div>` +
-                `<div class="spoolman-id">#${s.id}</div>` +
-            `</div>`;
-        item.addEventListener('click', () => pickSpool(s.id));
-        list.appendChild(item);
-    });
+    appendSpoolPickerGroup(list, 'Linked to this tag', grouped.linked);
+    appendSpoolPickerGroup(list, 'Currently assigned', grouped.current);
+    appendSpoolPickerGroup(list, 'Suggested', grouped.suggested, true);
+    appendSpoolPickerGroup(list, 'All spools', grouped.all);
+
+    if (!grouped.linked.length && !grouped.current.length
+            && !grouped.suggested.length && !grouped.all.length) {
+        const empty = document.createElement('div');
+        empty.className = 'spoolman-empty';
+        empty.textContent = 'No spools found';
+        list.appendChild(empty);
+    }
+}
+
+function spoolHasCardUid(spool, expectedUid) {
+    if (!expectedUid) return true;
+    const decoded = RfidPort.decodeExtra(spool?.extra?.card_uids);
+    const values = Array.isArray(decoded)
+        ? decoded
+        : (typeof decoded === 'string' ? decoded.split(/[,;]+/) : []);
+    return values.some(value => RfidPort.normalizeUid(value) === expectedUid);
+}
+
+async function waitForSpoolAssignment(channel, spoolId, expectedUid, timeoutMs = 12000) {
+    const deadline = Date.now() + timeoutMs;
+    let lastError = null;
+    while (Date.now() < deadline) {
+        try {
+            const [spool, status] = await Promise.all([
+                fetchSpoolmanSpool(spoolId),
+                queryAndSubscribe(),
+            ]);
+            const assignedId = Number(
+                status?.print_task_config?.filament_spool_id?.[channel] || 0
+            );
+            if (assignedId === Number(spoolId)
+                    && spoolHasCardUid(spool, expectedUid)) {
+                return spool;
+            }
+        } catch (error) {
+            lastError = error;
+        }
+        await new Promise(resolve => setTimeout(resolve, 300));
+    }
+    const detail = lastError?.message ? `: ${lastError.message}` : '';
+    throw new Error(`SpoolLink did not confirm the channel and card_uids update${detail}`);
 }
 
 async function pickSpool(spoolId) {
     if (spoolPickerChannel === null) return;
     const channel = spoolPickerChannel;
+    const expectedUid = RfidPort.normalizeUid(
+        spoolPickerContext?.uid || cachedUidForSlot(channel)
+    );
     closeModal('spoolman-modal');
     try {
         showStatus('Assigning spool…', 'info');
         await sendGcode(`SET_SPOOL_ID LANE=E${channel} SPOOL_ID=${spoolId}`);
-        const spool = await fetchSpoolmanSpool(spoolId);
+        const spool = await waitForSpoolAssignment(
+            channel, spoolId, expectedUid
+        );
         if (spool) spoolmanSpools.set(spoolId, spool);
         showStatus(`Spool #${spoolId} assigned to Extruder ${channel + 1}`, 'success');
     } catch (err) {
@@ -743,9 +2459,9 @@ async function clearSpoolForChannel(channel) {
     try {
         showStatus('Clearing spool…', 'info');
         await sendGcode(`SET_SPOOL_ID LANE=E${channel} SPOOL_ID=0`);
-        showStatus(`Extruder ${channel + 1} spool cleared`, 'success');
+        showStatus(`Extruder ${channel + 1} assignment cleared; the tag remains linked in Spoolman`, 'success');
     } catch (err) {
-        showStatus(`Failed to clear spool: ${err.message}`, 'error');
+        showStatus(`Failed to clear channel assignment: ${err.message}`, 'error');
     }
 }
 
@@ -824,7 +2540,55 @@ function initializeModals() {
         if (e.key === 'Escape') {
             closeModal('overwrite-modal'); closeModal('spoolman-modal');
             closeModal('mismatch-modal');
+            closeModal('tag-details-modal'); closeModal('spoolman-fields-modal');
+            closeSpoolmanMetadataSync();
+            closeTigerTagEditor();
         }
+    });
+
+    document.getElementById('tag-details-close').addEventListener('click', () => closeModal('tag-details-modal'));
+    document.getElementById('tag-details-done').addEventListener('click', () => closeModal('tag-details-modal'));
+    document.getElementById('tag-details-modal').addEventListener('click', e => {
+        if (e.target.id === 'tag-details-modal') closeModal('tag-details-modal');
+    });
+
+    document.getElementById('spoolman-fields-button').addEventListener('click', openSpoolmanFields);
+    document.getElementById('spoolman-fields-close').addEventListener('click', () => closeModal('spoolman-fields-modal'));
+    document.getElementById('spoolman-fields-cancel').addEventListener('click', () => closeModal('spoolman-fields-modal'));
+    document.getElementById('spoolman-fields-refresh').addEventListener('click', () => void refreshSpoolmanFieldStatus());
+    document.getElementById('spoolman-fields-add').addEventListener('click', () => void addSelectedSpoolmanFields());
+    document.getElementById('spoolman-fields-modal').addEventListener('click', e => {
+        if (e.target.id === 'spoolman-fields-modal') closeModal('spoolman-fields-modal');
+    });
+
+    document.getElementById('spoolman-sync-close').addEventListener('click', closeSpoolmanMetadataSync);
+    document.getElementById('spoolman-sync-cancel').addEventListener('click', closeSpoolmanMetadataSync);
+    document.getElementById('spoolman-sync-apply').addEventListener('click', () => void applySpoolmanMetadataSync());
+    document.getElementById('spoolman-sync-modal').addEventListener('click', e => {
+        if (e.target.id === 'spoolman-sync-modal') closeSpoolmanMetadataSync();
+    });
+
+    document.getElementById('tigertag-close').addEventListener('click', closeTigerTagEditor);
+    document.getElementById('tigertag-cancel').addEventListener('click', closeTigerTagEditor);
+    document.getElementById('tigertag-modal').addEventListener('click', e => {
+        if (e.target.id === 'tigertag-modal') closeTigerTagEditor();
+    });
+    document.getElementById('tigertag-source-tag').addEventListener('click', loadTigerTagSourceFromTag);
+    document.getElementById('tigertag-source-spool').addEventListener('click', loadTigerTagSourceFromSpool);
+    document.getElementById('tigertag-form').addEventListener('submit', event => {
+        void reviewTigerTagWrite(event);
+    });
+    document.getElementById('tigertag-aspect-1').addEventListener('change', updateTigerTagColorActivity);
+    document.getElementById('tigertag-aspect-2').addEventListener('change', updateTigerTagColorActivity);
+    document.getElementById('tigertag-message').addEventListener('input', setTigerTagMessageByteCount);
+    document.getElementById('tigertag-allow-unrecognized').addEventListener('change', updateTigerTagAuthoringGate);
+    document.getElementById('tigertag-allow-legacy').addEventListener('change', updateTigerTagAuthoringGate);
+    document.getElementById('tigertag-preview-back').addEventListener('click', backToTigerTagEditor);
+    document.getElementById('tigertag-confirm-write').addEventListener('click', () => {
+        void confirmTigerTagWrite();
+    });
+    document.getElementById('tigertag-clear').addEventListener('click', () => {
+        void clearTigerTag();
     });
 
     document.getElementById('mismatch-close').addEventListener('click', () => closeModal('mismatch-modal'));
@@ -875,7 +2639,7 @@ function initializeModals() {
         if (e.target.id === 'spoolman-modal') closeModal('spoolman-modal');
     });
     document.getElementById('spoolman-search').addEventListener('input', e => {
-        renderSpoolList(e.target.value);
+        renderGroupedSpoolList(e.target.value);
     });
 
     document.querySelectorAll('.modal-close-ow').forEach(btn => {

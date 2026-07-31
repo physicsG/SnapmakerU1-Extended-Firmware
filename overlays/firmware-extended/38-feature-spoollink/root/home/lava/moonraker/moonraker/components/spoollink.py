@@ -56,6 +56,7 @@ class SpoolLink:
         self.klippy_apis: APIComp = self.server.lookup_component("klippy_apis")
 
         self._channel_uids: Dict[int, str] = {}
+        self._channel_tag_identity: Dict[int, Dict[str, str]] = {}
         self._toolhead_extruder: str = "extruder"
         self._ptc_spool_ids: List[int] = []
         self._active_spool_id: Optional[int] = None
@@ -88,6 +89,7 @@ class SpoolLink:
     def _handle_klippy_disconnect(self) -> None:
         logging.info("[spoollink] Klippy disconnected")
         self._channel_uids = {}
+        self._channel_tag_identity = {}
         self._ptc_spool_ids = []
         self._active_spool_id = None
 
@@ -131,12 +133,22 @@ class SpoolLink:
         if not isinstance(info, dict):
             return
         uid_hex = self._uid_to_hex(info.get("CARD_UID"))
+        identity = {
+            "card_type": str(info.get("CARD_TYPE") or ""),
+            "tag_format": str(info.get("TAG_FORMAT") or ""),
+        }
         prev = self._channel_uids.get(ch, "")
         self._channel_uids[ch] = uid_hex
+        if uid_hex:
+            self._channel_tag_identity[ch] = identity
+        else:
+            self._channel_tag_identity.pop(ch, None)
         if uid_hex and uid_hex != prev:
             logging.info("[spoollink] ch%d: card UID changed to %s, resolving",
                          ch, uid_hex)
-            self._fire(self._resolve_spool(ch, card_uid=uid_hex))
+            self._fire(self._resolve_spool(
+                ch, card_uid=uid_hex, card_type=identity["card_type"],
+                tag_format=identity["tag_format"]))
 
     # -- Active spool sync --------------------------------------------------
 
@@ -351,12 +363,16 @@ class SpoolLink:
     # -- Resolution ---------------------------------------------------------
 
     async def _resolve_spool(self, channel: int, spool_id: Any = None,
-                             card_uid: Any = None) -> None:
+                             card_uid: Any = None, card_type: Any = None,
+                             tag_format: Any = None) -> None:
         spool_id = spool_id or None
         card_uid = card_uid or None
         if channel is None:
             logging.error("[spoollink] resolve_spool: missing channel")
             return
+        saved_identity = self._channel_tag_identity.get(channel, {})
+        card_type = str(card_type or saved_identity.get("card_type") or "")
+        tag_format = str(tag_format or saved_identity.get("tag_format") or "")
         logging.debug("[spoollink] ch%d: resolve spool_id=%s card_uid=%s",
                       channel, spool_id, card_uid)
         spool_by_id = None
@@ -380,7 +396,7 @@ class SpoolLink:
                               channel, e)
                 spoolman_ok = False
 
-        if len(spools_by_card) > 1:
+        if len(spools_by_card) > 1 and spool_by_id is None:
             ids = ", ".join(f"#{s['id']}" for s in spools_by_card)
             logging.warning("[spoollink] ch%d: card %s assigned to multiple spools: %s",
                             channel, card_uid, ids)
@@ -411,6 +427,15 @@ class SpoolLink:
                 return
 
         if card_uid is not None and spool_by_id is not None:
+            if not spoolman_ok:
+                await self._spoollink_set(
+                    channel,
+                    f"SpoolLink: E{channel + 1} could not verify current owners "
+                    f"for card {card_uid}; assignment was not changed",
+                    status="error")
+                return
+
+            binding_errors: List[str] = []
             if card_uid.upper() not in _parse_card_uids(spool_by_id):
                 try:
                     spool = await self._retry(
@@ -420,6 +445,7 @@ class SpoolLink:
                 except Exception as e:
                     logging.error("[spoollink] ch%d: bind spool %s failed: %s",
                                   channel, spool_by_id["id"], e)
+                    binding_errors.append(f"bind spool #{spool_by_id['id']}: {e}")
 
             for stale in spools_by_card:
                 if stale["id"] == spool_by_id["id"]:
@@ -433,14 +459,49 @@ class SpoolLink:
                     logging.error(
                         "[spoollink] ch%d: unbind card %s from spool %s failed: %s",
                         channel, card_uid, stale["id"], e)
+                    binding_errors.append(f"unbind spool #{stale['id']}: {e}")
+
+            if binding_errors:
+                await self._spoollink_set(
+                    channel,
+                    f"SpoolLink: E{channel + 1} card assignment failed: "
+                    + "; ".join(binding_errors),
+                    status="error")
+                return
+
+            try:
+                verified_owners = await self._retry(
+                    self._spoolman_find_by_card, card_uid)
+            except Exception as e:
+                await self._spoollink_set(
+                    channel,
+                    f"SpoolLink: E{channel + 1} could not verify card "
+                    f"assignment: {e}",
+                    status="error")
+                return
+
+            selected_id = int(spool_by_id["id"])
+            owner_ids = {int(owner["id"]) for owner in verified_owners}
+            if owner_ids != {selected_id}:
+                await self._spoollink_set(
+                    channel,
+                    f"SpoolLink: E{channel + 1} card assignment was not "
+                    f"persisted uniquely (owners: {sorted(owner_ids)})",
+                    status="error")
+                return
+            spool = next(owner for owner in verified_owners
+                         if int(owner["id"]) == selected_id)
 
         if card_uid is not None and spoolman_ok:
             self._save_cache(card_uid, spool)
 
-        await self._apply_spool(channel, spool, card_uid or "", cached=cached)
+        await self._apply_spool(
+            channel, spool, card_uid or "", cached=cached,
+            card_type=card_type, tag_format=tag_format)
 
     async def _apply_spool(self, channel: int, spool: dict, uid_hex: str,
-                           cached: bool = False) -> None:
+                           cached: bool = False, card_type: str = "",
+                           tag_format: str = "") -> None:
         spool_id = spool.get("id", 0)
         filament = spool.get("filament", {})
         material = filament.get("material", "PLA")
@@ -476,7 +537,8 @@ class SpoolLink:
             "SKU": 0,
             "SPOOL_ID": spool_id,
             "CARD_UID": card_uid,
-            "CARD_TYPE": 0,
+            "CARD_TYPE": card_type,
+            "TAG_FORMAT": tag_format,
         }
 
         label = f"{vendor} {material}"
