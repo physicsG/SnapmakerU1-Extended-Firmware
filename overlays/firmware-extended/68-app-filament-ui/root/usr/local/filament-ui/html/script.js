@@ -178,6 +178,31 @@ function invalidateOpenRfidSlot(slot) {
     openRfidSlotGenerations[slot] += 1;
     openRfidScans.delete(slot);
 }
+function uidHexToBytes(uidHex) {
+    const normalized = RfidPort.normalizeUid(uidHex);
+    if (!normalized) return [];
+    const bytes = [];
+    for (let index = 0; index < normalized.length; index += 2) {
+        bytes.push(parseInt(normalized.slice(index, index + 2), 16));
+    }
+    return bytes;
+}
+
+function shouldAcceptUnconfirmedOpenRfidScan(scan, previousScan) {
+    if (!scan || typeof scan !== 'object') return false;
+    const slot = Number(scan.slot);
+    if (!Number.isInteger(slot) || slot < 0 || slot >= 4) return false;
+    if (scan.event !== 'tag_read' && scan.event !== 'tag_parse_error') return false;
+    if (!RfidPort.normalizeUid(scan.uid)) return false;
+
+    const previousTs = previousScan && previousScan.ts != null
+        ? Number(previousScan.ts) : null;
+    const scanTs = scan.ts != null ? Number(scan.ts) : null;
+    if (previousTs !== null && isFinite(previousTs)) {
+        if (scanTs === null || !isFinite(scanTs) || scanTs < previousTs) return false;
+    }
+    return true;
+}
 
 function markOpenRfidAvailable() {
     openRfidAvailable = true;
@@ -216,7 +241,12 @@ async function acceptOpenRfidScan(scan, confirmWithPrinter) {
         }
     }
 
-    if (!RfidPort.shouldAcceptScan(scan, printerUid, openRfidScans.get(slot))) return false;
+    const previousScan = openRfidScans.get(slot);
+    if (printerUid) {
+        if (!RfidPort.shouldAcceptScan(scan, printerUid, previousScan)) return false;
+    } else if (!shouldAcceptUnconfirmedOpenRfidScan(scan, previousScan)) {
+        return false;
+    }
 
     markOpenRfidAvailable();
     openRfidScans.set(slot, { ...scan, _presenceGeneration: generation });
@@ -1074,14 +1104,18 @@ function closeTigerTagEditor() {
     closeModal('tigertag-modal');
 }
 
-async function openTigerTagEditor(channelNumber) {
+async function openTigerTagEditor(channelNumber, options = {}) {
     const channel = channelsData.find(item => item.channel === channelNumber);
     const uid = TigerTagAuthoring.normalizeUid(channel?.physical?.uidHex);
-    if (!channel || !uid || channel.physical?.hardwareType !== 'ultralight') {
-        showStatus('TigerTag writing requires a present Ultralight / NTAG with a 7-byte UID', 'error');
+    const convertRequested = options.mode === 'convert';
+    if (!channel || !uid) {
+        showStatus('TigerTag editing requires a present tag with a 7-byte UID', 'error');
         return;
     }
-
+    if (convertRequested && channel.physical?.hardwareType !== 'ultralight') {
+        showStatus('TigerTag conversion requires a present Ultralight / NTAG with a 7-byte UID', 'error');
+        return;
+    }
     const context = {
         channel: channelNumber,
         uid,
@@ -1090,12 +1124,14 @@ async function openTigerTagEditor(channelNumber) {
         spool: channel.spool_id != null ? spoolmanSpools.get(channel.spool_id) || null : null,
         draft: null,
         source: '',
+        mode: convertRequested ? 'convert' : 'edit',
     };
     tigerTagAuthoringContext = context;
     tigerTagAuthoringPreview = null;
     document.getElementById('tigertag-title').textContent =
-        'TigerTag Editor - Extruder ' + (channelNumber + 1);
-    document.getElementById('tigertag-allow-unrecognized').checked = false;
+        (convertRequested ? 'Convert to TigerTag - Extruder ' : 'TigerTag Editor - Extruder ') + (channelNumber + 1);
+    document.getElementById('tigertag-allow-unrecognized').checked =
+        convertRequested && channel.tag_format !== 'tigertag';
     document.getElementById('tigertag-allow-legacy').checked = false;
     document.getElementById('tigertag-form').style.display = 'none';
     document.getElementById('tigertag-preview').style.display = 'none';
@@ -1664,23 +1700,26 @@ async function refreshSingleChannel(channel) {
 // ── Channel parsing ───────────────────────────────────────────────────────
 
 function parseChannelInfo(i, fd, fdState, ptc) {
-    // CARD_UID always from filament_detect
-    const uid = fd.CARD_UID || [];
+    const cachedOpenRfidScan = openRfidScans.get(i) || null;
+    const scanUid = RfidPort.normalizeUid(cachedOpenRfidScan?.uid);
+    const scanFresh = !!(scanUid
+        && cachedOpenRfidScan?._presenceGeneration === openRfidSlotGenerations[i]
+        && cachedOpenRfidScan?.event !== 'tag_not_present');
+    const fdUidHex = RfidPort.normalizeUid(fd.CARD_UID);
+    const uidHex = fdUidHex || (scanFresh ? scanUid : '');
+    const uid = uidHexToBytes(uidHex);
     const hasUid = uid.length > 0;
-    const cardType = fd.CARD_TYPE || null;
+    const cardType = fd.CARD_TYPE || (scanFresh ? cachedOpenRfidScan?.tag_type || null : null);
     const tagStatus = fd.TAG_STATUS || null;
     const fdMainType = fd.MAIN_TYPE && fd.MAIN_TYPE !== 'NONE' ? fd.MAIN_TYPE : null;
     const present = fdState === FD_STATE_DETECTING || hasUid;
-    const uidHex = RfidPort.normalizeUid(uid);
-    const cachedOpenRfidScan = openRfidScans.get(i) || null;
-    const scanUid = RfidPort.normalizeUid(cachedOpenRfidScan?.uid);
-    const scanMatches = !!(uidHex && scanUid && uidHex === scanUid
-        && cachedOpenRfidScan?._presenceGeneration === openRfidSlotGenerations[i]
-        && cachedOpenRfidScan?.event !== 'tag_not_present');
+    const scanMatches = !!(scanFresh && scanUid === uidHex);
     const decoded = scanMatches && cachedOpenRfidScan?.filament
         ? RfidPort.normalizeDecoded(cachedOpenRfidScan.filament, fd.TAG_FORMAT)
         : null;
-    const tagFormat = decoded?.tagFormat || (hasUid ? (fd.TAG_FORMAT || null) : null);
+    const tagFormat = hasUid
+        ? RfidPort.formatFromFilament({ tag_format: decoded?.tagFormat || fd.TAG_FORMAT }, fd.TAG_FORMAT)
+        : null;
     const hardwareType = RfidPort.hardwareFrom(
         scanMatches ? cachedOpenRfidScan?.tag_type : null,
         cardType
@@ -1817,6 +1856,19 @@ function renderChannels() {
     const grid = document.getElementById('channels-grid');
     grid.innerHTML = '';
     channelsData.forEach(ch => grid.appendChild(createChannelCard(ch)));
+}
+
+function tigerTagActionState(channel, mode) {
+    const format = channel?.tag_format || 'unknown';
+    const isTigerTag = format === 'tigertag';
+    if (mode === 'edit' && !isTigerTag) return null;
+    if (mode === 'convert' && isTigerTag) return null;
+    if (mode === 'convert' && channel?.physical?.hardwareType !== 'ultralight') return null;
+
+    const uncertain = tigerTagUncertainOperations.get(channel.channel);
+    const reasons = [];
+    if (uncertain) reasons.push('Operation ' + uncertain.operationId + ' is unresolved');
+    return { disabled: reasons.length > 0, title: reasons.join('. ') };
 }
 
 function createChannelCard(channel) {
@@ -2031,6 +2083,7 @@ function createChannelCard(channel) {
 
     const mkBtn = (text, extra, handler) => {
         const btn = document.createElement('button');
+        btn.type = 'button';
         btn.className = 'channel-action-btn' + (extra ? ' ' + extra : '');
         btn.textContent = text;
         btn.addEventListener('click', handler);
@@ -2041,44 +2094,21 @@ function createChannelCard(channel) {
     actions.appendChild(mkBtn('✎ User', '', () => openOverwriteModal(channel.channel)));
     if (hasUid) actions.appendChild(mkBtn('Details', '', () => openTagDetails(channel.channel)));
     if (hasUid && openRfidAvailable) {
-        const authorButton = mkBtn('TigerTag', '', () => void openTigerTagEditor(channel.channel));
-        const writer = channel.openRfidCapabilities?.tigertag_write;
-        const globalCapabilities = openRfidApi?.capabilities || {};
-        const reasons = [];
-        if (channel.physical?.hardwareType !== 'ultralight') {
-            reasons.push('Only Ultralight / NTAG hardware is writable');
+        const editState = tigerTagActionState(channel, 'edit');
+        if (editState) {
+            const editButton = mkBtn('TigerTag', '', () => void openTigerTagEditor(channel.channel, { mode: 'edit' }));
+            editButton.disabled = editState.disabled;
+            editButton.title = editState.title;
+            actions.appendChild(editButton);
         }
-        if (globalCapabilities.tigertag_options !== true
-                || globalCapabilities.tigertag_encode !== true
-                || globalCapabilities.tigertag_write !== true
-                || globalCapabilities.expected_uid_required !== true
-                || globalCapabilities.expected_format !== 'tigertag'
-                || globalCapabilities.print_state_guard !== true) {
-            reasons.push('TigerTag authoring is disabled by OpenRFID');
+
+        const convertState = tigerTagActionState(channel, 'convert');
+        if (convertState) {
+            const convertButton = mkBtn('Convert to TigerTag', '', () => void openTigerTagEditor(channel.channel, { mode: 'convert' }));
+            convertButton.disabled = convertState.disabled;
+            convertButton.title = convertState.title;
+            actions.appendChild(convertButton);
         }
-        if (!writer || writer.supported !== true) {
-            reasons.push(writer?.error || 'This reader does not support guarded TigerTag writes');
-        }
-        if (openRfidApi?.write_allowed === false) {
-            reasons.push(openRfidApi.write_block?.error || 'The printer write gate is closed');
-        }
-        if (TigerTagAuthoring.protectedTigerTag(channel)) {
-            reasons.push('TigerTag+ is read-only');
-        }
-        if (TigerTagAuthoring.migratableLegacyTag(channel)
-                && (openRfidApi?.allow_legacy_migration_write !== true
-                    || writer?.allow_legacy_migration_supported !== true)) {
-            reasons.push('legacy_openrfid_v1 migration is disabled');
-        }
-        if (channel.tag_format !== 'tigertag'
-                && openRfidApi?.allow_unrecognized_write !== true) {
-            reasons.push('Blank/unrecognized NTAG initialization is disabled');
-        }
-        const uncertain = tigerTagUncertainOperations.get(channel.channel);
-        if (uncertain) reasons.push('Operation ' + uncertain.operationId + ' is unresolved');
-        authorButton.disabled = reasons.length > 0;
-        authorButton.title = reasons.join('. ');
-        actions.appendChild(authorButton);
     }
     actions.appendChild(mkBtn('Reset', '', () => resetChannel(channel.channel)));
     if (spoolmanActive) {

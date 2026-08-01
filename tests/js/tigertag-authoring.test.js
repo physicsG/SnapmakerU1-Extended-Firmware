@@ -175,6 +175,44 @@ test('tag prefill preserves raw IDs, all colors, available quantity, message, an
     assert.equal(draft.tdMm, 4.2);
 });
 
+test('tag prefill accepts overview color encodings and old spools raw names', () => {
+    const channel = {
+        decoded: {
+            fields: {
+                type: 'PLA', manufacturer: 'Example', modifiers: ['Bicolor'],
+                colors_rgba: [0x11223380, 0x445566FF], diameter_mm: 1.75,
+                weight_grams: 1000, available_weight_grams: 650, quantity_unit: 'g',
+                hotend_min_temp_c: 190, hotend_max_temp_c: 230,
+                bed_temp_min_c: 45, bed_temp_max_c: 60,
+                drying_temp_c: 50, drying_time_hours: 8,
+                manufacturing_date: '2026-07-31', message: 'Overview mapped',
+            },
+            formatData: {
+                variant: 'maker',
+                product_type: { id: 142, label: 'Filament' },
+                material: { id: 38219, label: 'PLA' },
+                aspects: [{ id: 252, label: 'Bicolor', color_count: 2 }, { id: 0, label: '-', color_count: 0 }],
+                raw: {
+                    materialId: 38219, brandId: 42, aspect1Id: 252, aspect2Id: 0,
+                    typeId: 142, diameterId: 56, measure: 1000,
+                    measure_available: 650, id_unit: 21,
+                    timestamp: 0x12345678, tdRaw: 42,
+                },
+            },
+        },
+    };
+    const draft = TigerTagAuthoring.draftFromTag(channel);
+    assert.equal(draft.material, 38219);
+    assert.equal(draft.brand, 42);
+    assert.equal(draft.aspect1, 252);
+    assert.equal(draft.productType, 142);
+    assert.equal(draft.diameter, 56);
+    assert.deepEqual(draft.colors, ['112233', '445566']);
+    assert.deepEqual(draft.storedColors, ['112233', '445566', '000000']);
+    assert.equal(draft.primaryColorAlpha, 0x80);
+    assert.equal(draft.measureAvailable, 650);
+    assert.equal(draft.tdMm, 4.2);
+});
 test('unchanged tag draft keeps raw alpha, dormant colors, and timestamp in the encoder spec', () => {
     const channel = {
         tag_format: 'tigertag',
@@ -283,6 +321,10 @@ test('authoring gate permits Maker and separately confirmed exact legacy migrati
             raw: { id_tigertag: 0x5BF59264, id_product: 0xFFFFFFFF },
         } },
     };
+    assert.equal(TigerTagAuthoring.authoringGate(api, channel, false).ok, true);
+
+    channel.decoded.formatData.variant = 'Basic';
+    channel.decoded.formatData.raw = { id_tigertag: 0x5BF59264, id_product: 0xFFFFFFFF };
     assert.equal(TigerTagAuthoring.authoringGate(api, channel, false).ok, true);
 
     channel.decoded.formatData.variant = 'plus';

@@ -76,9 +76,12 @@
         return /^[0-9a-f]{14}$/i.test(text) ? text.toUpperCase() : '';
     }
 
-    function normalizeColor(value) {
+    function normalizeColor(value, encoding) {
         if (typeof value === 'number' && isFinite(value)) {
-            return ('000000' + ((value >>> 0) & 0xFFFFFF).toString(16)).slice(-6).toUpperCase();
+            var number = value >>> 0;
+            if (encoding === 'argb') return ('000000' + (number & 0xFFFFFF).toString(16)).slice(-6).toUpperCase();
+            if (encoding === 'rgba') return ('000000' + ((number >>> 8) & 0xFFFFFF).toString(16)).slice(-6).toUpperCase();
+            return ('000000' + (number & 0xFFFFFF).toString(16)).slice(-6).toUpperCase();
         }
         if (typeof value !== 'string') return '';
         var text = value.trim().replace(/^#/, '');
@@ -87,6 +90,7 @@
     }
 
     function byteHex(value) {
+        if (value === null || value === undefined || value === '') return '';
         var number = Number(value);
         if (!isFinite(number) || Math.floor(number) !== number || number < 0 || number > 0xFF) {
             return '';
@@ -96,9 +100,10 @@
 
     function colorFromRaw(raw, index) {
         var suffix = index === 1 ? '' : String(index);
-        var red = byteHex(raw['color_r' + suffix]);
-        var green = byteHex(raw['color_g' + suffix]);
-        var blue = byteHex(raw['color_b' + suffix]);
+        var legacySuffix = index === 1 ? '' : '_' + index;
+        var red = byteHex(first(raw, ['color_r' + suffix, 'color' + index + '_r', 'colorR' + legacySuffix], null));
+        var green = byteHex(first(raw, ['color_g' + suffix, 'color' + index + '_g', 'colorG' + legacySuffix], null));
+        var blue = byteHex(first(raw, ['color_b' + suffix, 'color' + index + '_b', 'colorB' + legacySuffix], null));
         return red && green && blue ? red + green + blue : '';
     }
 
@@ -111,16 +116,22 @@
         return /^[0-9a-f]{8}$/i.test(text) ? parseInt(text.slice(6), 16) : null;
     }
 
-    function colorsFromFields(fields) {
-        var source = fields.colors_rgba_hex || fields.colors || fields.colors_rgba || [];
+    function colorsFromValues(source, encoding) {
         if (!Array.isArray(source)) source = [source];
         var result = [];
         source.forEach(function (value) {
-            var color = normalizeColor(value);
+            var color = normalizeColor(value, encoding);
             // Equal colors in different slots are meaningful protocol data.
             if (color && result.length < 3) result.push(color);
         });
         return result;
+    }
+
+    function colorsFromFields(fields) {
+        if (own(fields, 'colors_rgba_hex')) return colorsFromValues(fields.colors_rgba_hex, 'rgba');
+        if (own(fields, 'colors_rgba')) return colorsFromValues(fields.colors_rgba, 'rgba');
+        if (own(fields, 'colors')) return colorsFromValues(fields.colors, 'argb');
+        return [];
     }
 
     function optionRecord(options, group, value) {
@@ -185,12 +196,44 @@
         return String(value || '').trim().toLowerCase();
     }
 
+    function protocolTagVariant(channel) {
+        var variant = tagVariant(channel);
+        if (variant === 'maker' || variant === 'init' || variant === 'plus'
+                || LEGACY_VARIANTS.indexOf(variant) !== -1
+                || /^legacy_openrfid_/.test(variant)
+                || /^legacy_.*plus/.test(variant)) {
+            return variant;
+        }
+        return '';
+    }
+
     function first(objectValue, keys, fallback) {
         for (var index = 0; index < keys.length; index += 1) {
             if (own(objectValue, keys[index]) && objectValue[keys[index]] !== null
                     && objectValue[keys[index]] !== undefined) return objectValue[keys[index]];
         }
         return fallback;
+    }
+
+    function recordValue(value, key) {
+        if (!object(value)) return value;
+        if (own(value, key)) return value[key];
+        if (own(value, 'id')) return value.id;
+        if (own(value, 'label')) return value.label;
+        if (own(value, 'name')) return value.name;
+        return value;
+    }
+
+    function aspectValue(formatValue, index, fallback) {
+        var aspects = Array.isArray(formatValue.aspects) ? formatValue.aspects : [];
+        if (aspects[index]) return recordValue(aspects[index], 'id');
+        return fallback;
+    }
+
+    function tdValue(fields, raw, formatValue) {
+        if (own(raw, 'td_raw')) return Number(raw.td_raw) / 10;
+        if (own(raw, 'tdRaw')) return Number(raw.tdRaw) / 10;
+        return first(fields, ['td_mm', 'td'], first(formatValue, ['td_mm', 'td'], 0));
     }
 
     function storedColorsFromTag(fields, raw) {
@@ -201,13 +244,27 @@
         return stored;
     }
 
+    function alphaFromNumericColor(value, encoding) {
+        if (typeof value !== 'number' || !isFinite(value)) return null;
+        var number = value >>> 0;
+        if (encoding === 'argb') return (number >>> 24) & 0xFF;
+        if (encoding === 'rgba') return number & 0xFF;
+        return null;
+    }
+
     function primaryAlphaFromTag(fields, raw) {
-        var rawAlpha = Number(raw.color_a);
+        var rawAlpha = Number(first(raw, ['color_a', 'color1_a', 'colorA'], undefined));
         if (isFinite(rawAlpha) && Math.floor(rawAlpha) === rawAlpha
                 && rawAlpha >= 0 && rawAlpha <= 0xFF) return rawAlpha;
-        var source = fields.colors_rgba_hex || fields.colors_rgba || fields.colors || [];
+        var source = [];
+        var encoding = '';
+        if (own(fields, 'colors_rgba_hex')) { source = fields.colors_rgba_hex; encoding = 'rgba'; }
+        else if (own(fields, 'colors_rgba')) { source = fields.colors_rgba; encoding = 'rgba'; }
+        else if (own(fields, 'colors')) { source = fields.colors; encoding = 'argb'; }
         if (!Array.isArray(source)) source = [source];
-        var fieldAlpha = source.length ? alphaFromColor(source[0]) : null;
+        var fieldAlpha = source.length && typeof source[0] === 'number'
+            ? alphaFromNumericColor(source[0], encoding)
+            : source.length ? alphaFromColor(source[0]) : null;
         if (fieldAlpha !== null) return fieldAlpha;
         var explicitAlpha = Number(fields.alpha);
         return isFinite(explicitAlpha) && explicitAlpha >= 0 && explicitAlpha <= 0xFF
@@ -221,18 +278,24 @@
         var modifiers = Array.isArray(fields.modifiers) ? fields.modifiers : [];
         var fieldColors = colorsFromFields(fields);
         var storedColors = storedColorsFromTag(fields, raw);
-        var aspects = formatData(channel).aspects;
+        var data = formatData(channel);
+        var aspects = data.aspects;
         var activeCount = Array.isArray(aspects)
             ? activeColorCount(aspects[0], aspects[1])
             : Math.max(1, Math.min(3, fieldColors.length || 1));
         return {
             inventoryName: '',
-            material: first(raw, ['id_material'], first(fields, ['type', 'material'], '')),
-            brand: first(raw, ['id_brand'], first(fields, ['manufacturer', 'brand'], '')),
-            aspect1: first(raw, ['id_aspect1', 'id_aspect_1'], modifiers[0] || 104),
-            aspect2: first(raw, ['id_aspect2', 'id_aspect_2'], modifiers[1] || 0),
-            productType: first(raw, ['id_type'], 142),
-            diameter: first(raw, ['id_diameter'], first(fields, ['diameter_mm'], 1.75)),
+            material: recordValue(first(raw, ['id_material', 'materialId'],
+                first(data, ['material'], first(fields, ['material_name', 'type', 'material'], ''))), 'id'),
+            brand: recordValue(first(raw, ['id_brand', 'brandId'],
+                first(data, ['brand'], first(fields, ['manufacturer', 'brand'], ''))), 'id'),
+            aspect1: first(raw, ['id_aspect1', 'id_aspect_1', 'aspect1Id'],
+                aspectValue(data, 0, modifiers[0] || 104)),
+            aspect2: first(raw, ['id_aspect2', 'id_aspect_2', 'aspect2Id'],
+                aspectValue(data, 1, modifiers[1] || 0)),
+            productType: recordValue(first(raw, ['id_type', 'typeId'], first(data, ['product_type', 'type'], 142)), 'id'),
+            diameter: recordValue(first(raw, ['id_diameter', 'diameterId'],
+                first(data, ['diameter'], first(fields, ['diameter_mm'], 1.75))), 'id'),
             // `colors` is the active aspect-driven edit surface. Keep all
             // three raw slots separately so inactive colors survive an edit.
             colors: storedColors.slice(0, activeCount),
@@ -251,9 +314,7 @@
             bedMax: first(raw, ['bed_max'], first(fields, ['bed_temp_max_c'], 0)),
             manufacturingDate: first(fields, ['manufacturing_date'], ''),
             timestamp: first(raw, ['timestamp'], null),
-            tdMm: own(raw, 'td_raw')
-                ? Number(raw.td_raw) / 10
-                : first(fields, ['td_mm', 'td'], 0),
+            tdMm: tdValue(fields, raw, data),
             message: first(raw, ['message'], first(fields, ['message', 'custom_message'], ''))
         };
     }
@@ -480,22 +541,22 @@
         var id = Number(first(raw, ['id_tigertag'], 0));
         return tagFormat(channel) === 'tigertag'
             && id === TIGERTAG_PLUS_ID
-            && LEGACY_VARIANTS.indexOf(tagVariant(channel)) === -1;
+            && LEGACY_VARIANTS.indexOf(protocolTagVariant(channel)) === -1;
     }
 
     function migratableLegacyTag(channel) {
         return tagFormat(channel) === 'tigertag'
-            && LEGACY_VARIANTS.indexOf(tagVariant(channel)) !== -1;
+            && LEGACY_VARIANTS.indexOf(protocolTagVariant(channel)) !== -1;
     }
 
     function writableTigerTagVariant(channel) {
-        var variant = tagVariant(channel);
+        var variant = protocolTagVariant(channel);
         if (variant === 'maker' || variant === 'init' || LEGACY_VARIANTS.indexOf(variant) !== -1) {
             return true;
         }
         if (variant) return false;
         var id = Number(first(rawTagData(channel), ['id_tigertag'], 0));
-        return id === TIGERTAG_MAKER_ID || id === TIGERTAG_INIT_ID;
+        return id === TIGERTAG_MAKER_ID || id === TIGERTAG_INIT_ID || id === 0;
     }
 
     function authoringGate(api, channel, allowUnrecognized, allowLegacyMigration) {

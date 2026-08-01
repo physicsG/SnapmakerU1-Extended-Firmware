@@ -17,6 +17,8 @@
 #   ./dev-local.sh clean-tmp
 #
 # Native Linux Docker users should prefer ./dev.sh.
+#
+# Example: ./dev-local.sh make build PROFILE=extended OUTPUT_FILE=firmware/U1_extended.bin
 
 set -e
 
