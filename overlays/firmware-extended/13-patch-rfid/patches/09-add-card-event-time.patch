@@ -1,9 +1,9 @@
 --- rootfs.original/home/lava/klipper/klippy/extras/filament_protocol.py
 +++ rootfs/home/lava/klipper/klippy/extras/filament_protocol.py
-@@ -36,6 +36,7 @@
-     'OFFICIAL': False,
+@@ -38,6 +38,7 @@
      'CARD_UID': 0,
      'CARD_TYPE': '',
+     'TAG_FORMAT': '',
 +    'CARD_EVENT_TIME': 0,
  }
  
