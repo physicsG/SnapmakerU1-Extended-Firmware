@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-PackageHomePage: https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware
+# SPDX-FileCopyrightText: Copyright (c) 2026 @paxx12
 
 import argparse
 import glob
@@ -168,8 +171,8 @@ class FirmwareConfigHandler(SimpleHTTPRequestHandler):
                 self._write_stream_chunk(f"=== {cfg.get('label', action)} ===\n")
                 self._write_stream_chunk(f"{cfg['message']}\n")
                 self._write_stream_chunk(f"\n")
-                exit_code, _ = self._stream_command(cfg["cmd"])
-                if exit_code == 0:
+                exit_code, stopped = self._stream_command(cfg["cmd"], stop_token=cfg.get("stop_token"))
+                if exit_code == 0 or stopped:
                     self._write_stream_chunk(f"\nSUCCESS: Completed successfully (exit code: 0)\n")
                 else:
                     self._write_stream_chunk(f"\nERROR: Failed with exit code: {exit_code}\n")

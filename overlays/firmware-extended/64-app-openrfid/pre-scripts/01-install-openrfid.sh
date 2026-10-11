@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-PackageHomePage: https://github.com/paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware
+# SPDX-FileCopyrightText: Copyright (c) 2026 @paxx12
 
 GIT_URL=https://github.com/physicsG/OpenRFID.git
-GIT_SHA=1d8229b307429adbcb73869d55637a61fee2a284
+GIT_SHA=af5ff9d027039820c9f8c7e75d3fdc50b8678b82
 
 # OpenRFID's TigerTag adapter imports the official SDK package directly.
 # Keep both inputs immutable so tag encoding and registry lookups remain

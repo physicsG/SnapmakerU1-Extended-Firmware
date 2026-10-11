@@ -35,6 +35,7 @@ def spool(spool_id: int, owns_uid: bool = True) -> dict:
 class ResolutionHarness(SPOOLLINK.SpoolLink):
     def __init__(self, selected: dict | None, owners: list[dict]) -> None:
         self.selected = selected
+        self._force_generic_vendor = False
         self.owners = list(owners)
         self._channel_tag_identity = {
             0: {"card_type": "NTAG", "tag_format": "tigertag"}

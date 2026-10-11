@@ -48,7 +48,7 @@ class OpenRfidInstallationTests(unittest.TestCase):
         text = INSTALL_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("GIT_URL=https://github.com/physicsG/OpenRFID.git", text)
         self.assertIn(
-            "GIT_SHA=1d8229b307429adbcb73869d55637a61fee2a284", text
+            "GIT_SHA=af5ff9d027039820c9f8c7e75d3fdc50b8678b82", text
         )
         self.assertIn(
             "TIGERTAG_SDK_SHA=f3e2e2e8a1fdf88f91fb43ca4b5c5fbfb88f81af",
@@ -130,7 +130,8 @@ class OpenRfidConfigurationTests(unittest.TestCase):
         parser = ConfigParser(interpolation=None, allow_no_value=True)
         parser.read(EXTENDED2_CFG, encoding="utf-8")
 
-        self.assertEqual(parser["components"]["rfid"], "snapmaker")
+        # The shipped file leaves rfid commented out; the runtime default is snapmaker.
+        self.assertNotIn("rfid", parser["components"])
         for key in (
             "enable_write",
             "allow_unrecognized_write",

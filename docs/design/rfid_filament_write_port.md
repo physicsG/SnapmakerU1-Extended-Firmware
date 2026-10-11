@@ -19,7 +19,7 @@ this branch.
   follow-up 868c13d
 - RFID default fix: upstream commit 8c20d3e
 - Write-capable OpenRFID: physicsG/OpenRFID at
-  1d8229b307429adbcb73869d55637a61fee2a284
+  af5ff9d027039820c9f8c7e75d3fdc50b8678b82
 - TigerTag SDK database pin:
   f3e2e2e8a1fdf88f91fb43ca4b5c5fbfb88f81af
 
